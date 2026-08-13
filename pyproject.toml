@@ -1,0 +1,36 @@
+[project]
+name = "search-agent"
+version = "0.1.0"
+description = "Агент поиска надёжных цен на товары (Excel → поиск → скрапинг → цена → отчёт)"
+requires-python = ">=3.11"
+# Список синхронизирован с requirements.txt — там же закреплены версии, которыми всё проверялось.
+dependencies = [
+    "click",
+    "fastapi",
+    "httpx",
+    "markdownify",
+    "openai",
+    "openpyxl",
+    "patchright",
+    "playwright",
+    "playwright-stealth",
+    "pydantic",
+    "python-multipart",
+    "pyyaml",
+    "selectolax",
+    "uvicorn[standard]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",      # офлайн-тесты (триаж/скоринг/парсинг), без вызова модели
+]
+
+[project.scripts]
+search-agent = "search_agent.cli:cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["search_agent*"]

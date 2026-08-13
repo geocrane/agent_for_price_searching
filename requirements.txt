@@ -1,0 +1,14 @@
+click==8.4.2
+fastapi==0.139.2
+httpx==0.28.1
+markdownify==1.2.3
+openai==2.46.0
+openpyxl==3.1.5
+patchright==1.61.2
+playwright==1.61.0
+playwright-stealth==2.0.3
+pydantic==2.13.4
+python-multipart==0.0.32
+pyyaml==6.0.3
+selectolax==0.4.11
+uvicorn[standard]==0.51.0

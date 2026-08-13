@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>search_agent · поиск цен</title>
+  <link rel="stylesheet" href="/styles.css?v=22" />
+</head>
+<body>
+  <!-- ================= Топбар ================= -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◐</span>
+      <span class="brand-name">search_agent</span>
+      <span class="brand-sub">агент поиска цен</span>
+    </div>
+    <div class="topbar-right">
+      <div class="usage" id="usage" title="Расход токенов (входящие ↑ / исходящие ↓) и стоимость в рублях">
+        <div class="usage-row">
+          <span class="usage-label">Сессия</span>
+          <span class="tok in" id="sesIn">0</span>
+          <span class="tok out" id="sesOut">0</span>
+          <span class="tok rub" id="sesRub">0&nbsp;₽</span>
+        </div>
+        <div class="usage-row">
+          <span class="usage-label">Всего</span>
+          <span class="tok in" id="cumIn">0</span>
+          <span class="tok out" id="cumOut">0</span>
+          <span class="tok rub" id="cumRub">0&nbsp;₽</span>
+          <button class="linklike" id="usageReset" title="Сбросить период">сброс</button>
+        </div>
+      </div>
+      <div class="status" id="status">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Локально</span>
+      </div>
+      <button class="btn ghost" id="selfTestBtn" title="Проверить связь: тестовый запрос в поисковую систему и в модель, с замером скорости">⚡ Проверка</button>
+      <button class="btn ghost" id="connectBtn">Модель</button>
+      <button class="btn ghost icon" id="themeBtn" title="Сменить тему">☾</button>
+      <button class="btn ghost icon" id="modeBtn" title="Режим открытия сайтов">⚙</button>
+    </div>
+  </header>
+
+  <!-- ================= Всегда-видимая строка статуса (из логов) ================= -->
+  <div class="statusstrip info" id="statusStrip">
+    <span class="sdot"></span>
+    <span class="stxt" id="statusMsg">Готово · локальный режим</span>
+  </div>
+
+  <!-- Состояние модели: пауза по лимиту API и ожидание восстановления. ОТДЕЛЬНАЯ полоса, а не
+       общая строка статуса: она обязана быть видна одновременно с ходом работы, и ничего
+       затирать не имеет права (урок «пакета 2 из 13», который перекрывал настоящий статус). -->
+  <div class="modelstate" id="modelState" hidden>
+    <span class="mdot"></span>
+    <span class="mtxt" id="modelStateMsg"></span>
+  </div>
+
+  <!-- Разбор наименований моделью до старта поиска. Тоже отдельная полоса: раньше он писал в
+       общую строку статуса раз в секунду и затирал весь ход работы. -->
+  <div class="modelstate parse" id="parseState" hidden>
+    <span class="mdot"></span>
+    <span class="mtxt" id="parseStateMsg"></span>
+  </div>
+
+  <!-- ================= Зона загрузки ================= -->
+  <section class="uploadbar">
+    <label class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" hidden />
+      <span class="dz-icon">⬆</span>
+      <span id="dzText">Перетащите Excel/CSV или нажмите для выбора</span>
+    </label>
+    <div class="map-summary" id="mapSummary" hidden></div>
+  </section>
+
+  <!-- ================= Основная зона (3 зоны: таблица | панель) ================= -->
+  <main class="workspace">
+    <!-- Левая: таблица позиций + run-бар -->
+    <section class="positions">
+      <div class="table-toolbar">
+        <button class="btn ghost small" id="collapseAllBtn" hidden title="Свернуть все раскрытые товары и вернуть панель справа">▸ Свернуть все</button>
+        <span class="muted small" id="tableHint"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="pos-table">
+          <thead>
+            <tr>
+              <th class="c-row">#</th>
+              <th class="c-name">Наименование</th>
+              <th class="c-stage">Статус</th>
+              <th class="c-price">Цена</th>
+              <th class="c-found" title="Название товара, который реально нашли на сайте и цена которого стоит в колонке «Цена»">Найдено</th>
+              <th class="c-range">Диапазон</th>
+              <th class="c-time" title="Активное время работы по позиции: этапы без ожидания в очереди">Время</th>
+            </tr>
+          </thead>
+          <tbody id="posBody">
+            <tr class="empty-row"><td colspan="7">Загрузите файл — здесь появятся товары.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="runbar">
+        <div class="run-fields">
+          <label class="fld">Уточнение к запросу (фраза-суффикс)
+            <input id="affix" value="цена купить" placeholder="напр.: купить в Ростове какая цена и срок доставки" />
+          </label>
+          <label class="chk" title="Модель перепишет наименования в «магазинные» запросы (коды спецификаций → слова). Пакетно, с проверкой соответствия позиции; что не прошло — по правилам.">
+            <input type="checkbox" id="llmToggle" /> Запросы формирует модель
+          </label>
+        </div>
+        <div class="run-actions">
+          <button class="btn primary" id="runBtn" title="Агент сам пройдёт весь путь по товарам: найдёт источники, загрузит все сайты, извлечёт цены и сведёт итог. Продолжит с места обрыва.">Найти</button>
+          <button class="btn ghost" id="stopBtn" hidden title="Остановить текущий поиск">⏹ Стоп</button>
+          <button class="btn" id="reportBtn" disabled title="Итоговый Excel-отчёт: лист «Итоги» (Товар, Цена, Тип, Найденное название, Мин, Макс, Источник, Ссылка, Комментарий) и лист «Детали» — все сайты выдачи с ценами, статусами и комментариями. Скачивается сразу: модель не вызывается">📑 Отчёт (xlsx)</button>
+          <button class="btn ghost danger" id="resetBtn" disabled title="Стереть весь прогресс поиска (с подтверждением) и начать заново">Сбросить прогресс</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Правая: вкладки Ход / Модель / Очередь (Диалог временно скрыт) -->
+    <section class="side">
+      <div class="tabs">
+        <!-- Диалог скрыт по решению пользователя: вернуть = снять hidden с кнопки и панели -->
+        <button class="tab" data-tab="dialog" hidden>Диалог</button>
+        <button class="tab" data-tab="queue" id="queueTab">Очередь</button>
+        <button class="tab active" data-tab="trace">Ход</button>
+        <button class="tab" data-tab="model" title="Что отвечает модель по каждой позиции">Модель</button>
+        <div class="tab-tools" id="traceTools" hidden>
+          <select id="logLevel" title="Уровень">
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO" selected>INFO</option>
+            <option value="WARNING">WARN</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+          <input id="logSearch" type="search" placeholder="фильтр…" />
+          <button class="linklike" id="logAutoscroll" data-on="1" title="Автоскролл">⬇ авто</button>
+          <button class="linklike" id="logClear" title="Очистить вид">очистить</button>
+        </div>
+        <div class="tab-tools" id="modelTools" hidden>
+          <input id="modelSearch" type="search" placeholder="номер или название…" title="Показать только записи по позициям, где встречается этот текст (можно номер позиции)" />
+          <button class="linklike" id="modelAutoscroll" data-on="1" title="Автоскролл">⬇ авто</button>
+          <button class="linklike" id="modelClear" title="Очистить вид">очистить</button>
+        </div>
+      </div>
+
+      <!-- Диалог: чат-исследователь (цены, сравнения по обзорам, разведка источников данных) -->
+      <div class="tab-panel" id="panel-dialog" hidden>
+        <div class="chat-bar">
+          <select id="chatList" title="История диалогов"></select>
+          <button class="btn ghost icon" id="chatNew" title="Новый диалог">＋</button>
+          <button class="btn ghost icon" id="chatDelete" title="Удалить диалог">🗑</button>
+          <button class="btn ghost" id="chatStop" hidden title="Остановить текущий запрос">⏹ Стоп</button>
+        </div>
+        <div class="messages" id="messages">
+          <div class="hint">
+            Спросите что угодно: «найди актуальные цены на канистры 20 л железные и сравни по
+            отзывам с пластиковыми», «сравни Huawei Free Clips 2 с Free Clips 1 по обзорам»,
+            «найди, где есть данные по закупкам с исторической ценой за 2022–2025, и составь
+            список источников с комментариями».<br />
+            Каждое утверждение агент подкрепляет ссылкой на источник, который он реально прочитал.
+          </div>
+        </div>
+        <div class="chat-input">
+          <textarea id="chatInput" rows="1" placeholder="Сообщение агенту…" disabled></textarea>
+          <button class="btn primary send" id="chatSend" disabled>▶</button>
+        </div>
+      </div>
+
+      <!-- Очередь задач (M8): что делается сейчас и что дальше -->
+      <div class="tab-panel" id="panel-queue" hidden>
+        <div class="stage-load" id="stageLoad" title="Сколько позиций сейчас внутри каждого этапа из разрешённого лимита и сколько ждут своей очереди"></div>
+        <div class="queue-wrap" id="queueWrap">
+          <div class="queue-empty" id="queueEmpty">Очередь пуста. Появится во время поиска («Найти»).</div>
+          <div class="queue-col" data-col="running"><h4>Сейчас</h4><div class="queue-list" id="qRunning"></div></div>
+          <div class="queue-col" data-col="queued"><h4>В очереди</h4><div class="queue-list" id="qQueued"></div></div>
+          <div class="queue-col" data-col="done"><h4>Готово</h4><div class="queue-list" id="qDone"></div></div>
+        </div>
+      </div>
+
+      <!-- Ход: только консольные логи (что делает программа) -->
+      <div class="tab-panel" id="panel-trace">
+        <div class="log-console" id="logConsole"></div>
+      </div>
+
+      <!-- Модель: что отвечает модель, отдельной записью на каждую позицию -->
+      <div class="tab-panel" id="panel-model" hidden>
+        <div class="log-console model-console" id="modelConsole">
+          <div class="hint">Здесь появятся ответы модели: по каждой позиции — её номер,
+            наименование и то, что модель ответила (разбор наименования, разбор страницы сайта,
+            комментарий к цене).</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================= Прогресс ================= -->
+  <footer class="progressbar">
+    <div class="counters" id="counters">
+      Товаров: <b id="cTotal">0</b> · найдено <b id="cFound">0</b> · аналог <b id="cAnalog">0</b> · не найдено <b id="cNone">0</b>
+      · время <b id="cElapsed" title="Общее время задачи: от нажатия «Найти» до конца прогона">0:00</b>
+    </div>
+  </footer>
+
+  <!-- ================= Модалка выбора модели ================= -->
+  <div class="modal-overlay" id="modal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Модель и поиск</h2>
+        <button class="btn ghost icon" id="modalClose">✕</button>
+      </div>
+      <form id="modelForm" class="form">
+        <label>Модель <span class="muted">(сортировка по цене, от дешёвой)</span>
+          <select name="model" id="modelSelect" required></select></label>
+        <div class="model-meta muted" id="modelMeta"></div>
+        <label>URL источника
+          <input name="base_url" id="modelBaseUrl" placeholder="https://foundation-models.api.cloud.ru/v1" autocomplete="off" /></label>
+        <label>Токен модели <span class="muted">(FOUNDATION_KEY; пусто — оставить сохранённый)</span>
+          <input name="token" id="modelToken" type="password" placeholder="вставьте токен один раз" autocomplete="off" /></label>
+
+        <!-- Ключ поиска здесь же: на бесплатном тарифе serper.dev 2500 запросов, и меняют его
+             посреди работы. Сохранение действует сразу — сервер перезапускать не нужно. -->
+        <label>Токен поиска <span class="muted">(SERPER_API_KEY, serper.dev; пусто — оставить сохранённый)</span>
+          <input name="serper_key" id="serperKey" type="password" placeholder="вставьте новый ключ, когда кончатся запросы" autocomplete="off" /></label>
+        <p class="muted small">Новый ключ поиска применяется сразу, перезапуск не нужен. Если прогон
+          начинался вообще без ключа, нажмите «Найти» ещё раз — поиск переключится на serper.dev.</p>
+
+        <div class="form-error" id="formError" hidden></div>
+        <div class="modal-actions">
+          <span class="muted" id="tokenState"></span>
+          <span class="muted" id="serperState"></span>
+          <button type="submit" class="btn primary" id="submitBtn">Сохранить</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ================= Модалка проверки системы ================= -->
+  <div class="modal-overlay" id="testModal" hidden>
+    <div class="modal wide">
+      <div class="modal-head">
+        <h2>Проверка системы</h2>
+        <button class="btn ghost icon" id="testClose">✕</button>
+      </div>
+      <div class="form">
+        <div class="check-list">
+          <div class="check" id="checkSearch">
+            <span class="check-dot">•</span>
+            <div>
+              <div class="check-name">Поисковая система</div>
+              <div class="check-detail muted" id="checkSearchDetail">не проверялась</div>
+            </div>
+          </div>
+          <div class="check" id="checkModel">
+            <span class="check-dot">•</span>
+            <div>
+              <div class="check-name">Модель</div>
+              <div class="check-detail muted" id="checkModelDetail">не проверялась</div>
+            </div>
+          </div>
+          <div class="check" id="checkSpeed">
+            <span class="check-dot">•</span>
+            <div>
+              <div class="check-name">Скорость генерации</div>
+              <div class="check-detail muted" id="checkSpeedDetail">не проверялась</div>
+            </div>
+          </div>
+        </div>
+        <div class="speed-box" id="speedBox" hidden>
+          <h3>Настройки скорости <span class="muted">(что сейчас действует)</span></h3>
+          <div class="speed-grid" id="speedGrid"></div>
+          <div class="speed-warn" id="speedWarn" hidden></div>
+        </div>
+        <div class="form-error" id="testError" hidden></div>
+        <div class="modal-actions">
+          <span class="muted" id="testHint">Тест делает один запрос в поиск и два коротких запроса к модели.</span>
+          <button type="button" class="btn primary" id="testRun">Проверить</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============== Модалка «Режим открытия сайтов» + «Сценарий очистки» ============== -->
+  <div class="modal-overlay" id="modeModal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Открытие сайтов и очистка</h2>
+        <button class="btn ghost icon" id="modeClose">✕</button>
+      </div>
+      <div class="mtabs">
+        <button type="button" class="mtab active" data-mtab="open">Режим открытия</button>
+        <button type="button" class="mtab" data-mtab="clean">Сценарий очистки</button>
+        <button type="button" class="mtab" data-mtab="profile">Профиль поиска</button>
+      </div>
+
+      <!-- ---- Вкладка: Профиль поиска (сохраняется на сервере, переживает перезапуск) ---- -->
+      <div class="form mtab-panel" id="mpanel-profile" hidden>
+        <p class="muted mode-intro">Настройка под ваш тип товаров: чем уточнять запросы, каким
+          поставщикам верить, какие сайты не открывать. Сохраняется и подставляется при следующем
+          запуске — в отличие от полей на главном экране.</p>
+
+        <div class="mode-group">
+          <div class="mode-group-t">Запросы</div>
+          <label class="fld">Уточнение к каждому запросу
+            <input id="profAffix" placeholder="напр.: купить в Ростове оптом с доставкой" />
+          </label>
+          <label class="chk"><input type="checkbox" id="profLlm" /> Модель разбирает наименования
+            <span class="muted">— коды спецификаций превращает в «магазинные» названия; разбор
+              запоминается, повторный прогон модель не переспрашивает</span></label>
+          <label class="chk"><input type="checkbox" id="profSecondPage" /> Смотреть вторую страницу выдачи, если цены не нашлось
+            <span class="muted">— только по таким позициям; если цена найдена, глубже не идём.
+              Каждая страница — отдельный запрос к поисковой системе</span></label>
+        </div>
+
+        <div class="mode-group">
+          <div class="mode-group-t">Источники</div>
+          <label class="fld">Приоритетные домены <span class="muted">(через запятую) — свои проверенные поставщики</span>
+            <input id="profPreferred" placeholder="petrovich.ru, vseinstrumenti.ru" />
+          </label>
+          <label class="fld">Не открывать <span class="muted">(через запятую) — бесполезные для вашей отрасли</span>
+            <input id="profBlocked" placeholder="market.yandex.ru, avito.ru" />
+          </label>
+        </div>
+
+        <div class="mode-group">
+          <div class="mode-group-t">Сопоставление</div>
+          <label class="chk"><input type="checkbox" id="profStrict" /> Отсеивать аналоги с иной фасовкой/размером
+            <span class="muted">— проверка характеристик кодом; совпавший артикул она не перебивает</span></label>
+        </div>
+
+        <div class="mode-group">
+          <div class="mode-group-t">Сколько источников проверять</div>
+          <label class="fld">Достаточно подтверждений цены
+            <select id="profEnough">
+              <option value="0">все найденные сайты (полный разброс цен)</option>
+              <option value="2">2 разных магазина — дальше не искать</option>
+              <option value="3">3 разных магазина — дальше не искать</option>
+              <option value="4">4 разных магазина — дальше не искать</option>
+            </select>
+            <span class="muted">— как только цена найдена на стольких РАЗНЫХ доменах, остальные
+              сайты позиции не открываются: это экономит бОльшую часть времени прогона. Плата —
+              разброс цен и коридор рынка считаются по меньшему числу источников</span>
+          </label>
+        </div>
+        <div class="form-error" id="profError" hidden></div>
+      </div>
+
+      <!-- ---- Вкладка: Режим открытия ---- -->
+      <div class="form mtab-panel" id="mpanel-open">
+        <p class="muted mode-intro">Уровень обхода блокировок. Чем выше — тем надёжнее открываются
+          защищённые сайты (вплоть до Ozon), но медленнее. Для лёгких сайтов и когда альтернатив много
+          хватит быстрого/базового.</p>
+        <div class="seg mode-seg" id="modeSeg">
+          <button type="button" class="seg-btn" data-preset="fast">Быстрый</button>
+          <button type="button" class="seg-btn active" data-preset="basic">Базовый</button>
+          <button type="button" class="seg-btn" data-preset="strong">Усиленный</button>
+          <button type="button" class="seg-btn" data-preset="max">Максимальный</button>
+          <button type="button" class="seg-btn" data-preset="custom">Свой</button>
+        </div>
+        <p class="muted mode-desc" id="modeDesc"></p>
+
+        <details class="advanced" id="modeAdv">
+          <summary>Дополнительно — отдельные приёмы и параметры</summary>
+
+          <!-- Мастер-переключатель: всё, что ниже помечено data-requires="browser", без него
+               не работает вовсе — поэтому гасится и блокируется синхронно (см. applyDeps в app.js). -->
+          <div class="mode-group">
+            <div class="mode-group-t">Способ открытия страниц</div>
+            <label class="chk master"><input type="checkbox" data-flag="backend" /> Браузер (Playwright) <span class="muted">— иначе быстрый httpx без JS, и приёмы ниже не применяются</span></label>
+          </div>
+
+          <div class="mode-group dep-group" data-group-requires="browser">
+            <div class="mode-group-t">Движок и маскировка <span class="dep-note muted">— нужен браузер</span></div>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="real_chrome" /> Настоящий Chrome <span class="muted">(channel=chrome)</span></label>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="anti_detect" /> Анти-детект (patchright) <span class="muted">— прячет автоматизацию, помогает против DataDome/Ozon; свой User-Agent и stealth-патчи при этом не применяются — patchright маскирует сам</span></label>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="headed" /> Графический режим <span class="muted">— на сервере невидимо (Xvfb); локально откроются окна</span></label>
+          </div>
+
+          <div class="mode-group dep-group" data-group-requires="browser">
+            <div class="mode-group-t">Сессия и поведение <span class="dep-note muted">— нужен браузер</span></div>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="persistent_profile" /> Постоянный профиль <span class="muted">— накапливает куки-допуск</span></label>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="http_first" /> Сначала без браузера <span class="muted">— пробовать лёгкий запрос, а Chrome открывать только если пришёл блок, пустая страница или оболочка без товара. Обычная страница магазина берётся за доли секунды вместо десятков</span></label>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="warmup" /> Прогрев <span class="muted">— заход на главную домена за куками ПЕРЕД ПОВТОРОМ после блока</span></label>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="human_input" /> Человеческий ввод <span class="muted">— движения мыши/скролл; один «человек» = одна вкладка, поэтому «Параллельно доменов» становится 1</span></label>
+            <label class="chk dep" data-requires="browser"><input type="checkbox" data-flag="wait_networkidle" /> Ждать дорисовку JS <span class="muted">— цена часто рендерится после загрузки DOM; ожидание включается, только если цены в тексте страницы ещё нет</span></label>
+          </div>
+
+          <div class="mode-group">
+            <div class="mode-group-t">Нагрузка и устойчивость</div>
+            <div class="mode-nums">
+              <label>Пауза между запросами, сек <span class="muted">(мин–макс)</span>
+                <span class="num-pair"><input type="number" data-num="delay_min" min="0" step="1" /> – <input type="number" data-num="delay_max" min="0" step="1" /></span>
+              </label>
+              <label>Таймаут, сек <input type="number" data-num="timeout" min="5" step="1" /></label>
+              <label>Кандидатов на товар <span class="muted">(0 — вся выдача)</span>
+                <input type="number" data-num="top_n_fetch" min="0" max="50" step="1" /></label>
+              <label data-num-disabled-by="human_input">Параллельно доменов
+                <input type="number" data-num="concurrency" min="1" max="8" step="1" />
+                <span class="dep-note muted"></span></label>
+              <label>Повторов при мягком блоке <input type="number" data-num="retry_on_block" min="0" max="5" step="1" /></label>
+              <label data-num-requires="retry_on_block">Cooldown перед повтором, сек <span class="muted">(мин–макс)</span>
+                <span class="num-pair"><input type="number" data-num="cooldown_min" min="0" step="1" /> – <input type="number" data-num="cooldown_max" min="0" step="1" /></span>
+                <span class="dep-note muted"></span>
+              </label>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- ---- Вкладка: Сценарий очистки ---- -->
+      <div class="form mtab-panel" id="mpanel-clean" hidden>
+        <p class="muted mode-intro">Что вырезать из страницы перед отправкой в модель. Меньше «мусора»
+          (меню, ссылки, баннеры) — точнее анализ и меньше токенов. Приоритет — не потерять цену:
+          блоки с ценой не удаляются. Структурные данные (JSON-LD/microdata) сохраняются всегда.</p>
+        <div class="seg mode-seg" id="cleanSeg">
+          <button type="button" class="seg-btn" data-clean-preset="safe">Безопасно</button>
+          <button type="button" class="seg-btn active" data-clean-preset="balanced">Сбалансированно</button>
+          <button type="button" class="seg-btn" data-clean-preset="max">Максимум</button>
+          <button type="button" class="seg-btn" data-clean-preset="custom">Свой</button>
+        </div>
+        <p class="muted mode-desc" id="cleanDesc"></p>
+
+        <details class="advanced" id="cleanAdv">
+          <summary>Дополнительно — отдельные фильтры</summary>
+          <div class="mode-group">
+            <div class="mode-group-t">Фильтры очистки</div>
+            <label class="chk"><input type="checkbox" data-cflag="strip_link_urls" /> Убирать адреса ссылок <span class="muted">— текст ссылки остаётся, URL вырезается (объём ×0.5, безопасно)</span></label>
+            <label class="chk"><input type="checkbox" data-cflag="remove_cookie_banner" /> Удалять cookie-баннеры <span class="muted">— блоки согласия на cookie/GDPR</span></label>
+            <label class="chk master"><input type="checkbox" data-cflag="drop_structural" /> Удалять меню/шапку/подвал <span class="muted">— только если внутри нет цены</span></label>
+            <label class="chk dep" data-crequires="drop_structural"><input type="checkbox" data-cflag="drop_structural_force" /> …даже если внутри есть цена <span class="muted">— агрессивно, риск потери цены</span></label>
+            <label class="chk"><input type="checkbox" data-cflag="link_density_prune" /> Удалять блоки-«меню» без разметки <span class="muted">— где почти весь текст — ссылки и нет цены</span></label>
+          </div>
+        </details>
+
+        <div class="mode-group">
+          <div class="mode-group-t">Применить к уже загруженным</div>
+          <p class="muted">Переочистить страницы из кэша новым сценарием — без повторного захода на
+            сайты. Затем откройте «показать контент», чтобы сравнить объём.</p>
+          <div class="num-pair">
+            <button type="button" class="btn ghost" id="cleanReclean">Переочистить кэш</button>
+            <span class="muted" id="cleanRecleanStatus"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="modeReset">Сбросить вкладку</button>
+        <button type="button" class="btn primary" id="modeSave">Готово</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="/app.js?v=31"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Windows-скрипт запуска должен приходить с CRLF на любой машине: cmd.exe местами спотыкается
+# на LF-переводах строк — в частности на goto внутри блоков, а такой переход в start.bat есть.
+*.bat text eol=crlf
+
+# Скрипты для macOS/Linux — наоборот, строго LF: с CRLF шебанг ломается («bad interpreter»).
+*.sh text eol=lf
+*.command text eol=lf

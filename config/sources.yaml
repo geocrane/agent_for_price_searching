@@ -1,0 +1,40 @@
+# Рейтинг источников (НЕ белый список): поиск ведётся везде, эти веса задают только
+# доверие. Незнакомый домен получает вес по умолчанию (см. default_weight) и НЕ
+# исключается. Веса/тиры можно перемечать по мере накопления данных.
+
+default_weight: 0.3          # незнакомый домен: учитываем, но с низким приоритетом
+blacklist: []                # домены-паразиты/спам → вес 0
+
+tiers:
+  1:                         # официальные / справочные — максимальный рейтинг
+    weight: 1.0
+    domains:
+      - zakupki.gov.ru       # ЕИС госзакупки (парсим напрямую, без платных API)
+      - fgiscs.minstroyrf.ru # ФГИС ЦС — сметные цены в строительстве
+      - fedstat.ru           # Росстат / ЕМИСС (SDMX-экспорт)
+      - rosstat.gov.ru
+  2:                         # вендор / дистрибьютор / B2B-площадки / стройритейл
+    weight: 0.8
+    domains:
+      - pulscen.ru
+      - satom.ru
+      - all.biz
+      - blizko.ru
+      - petrovich.ru
+      - leroymerlin.ru
+      - vseinstrumenti.ru
+      - obi.ru
+  3:                         # потребительские маркетплейсы (альтернативный блок цен)
+    weight: 0.6
+    domains:
+      - wildberries.ru
+      - wb.ru
+      - ozon.ru
+      - market.yandex.ru
+      - dns-shop.ru
+      - citilink.ru
+      - megamarket.ru
+  4:                         # классифайды / мелкие / прочее
+    weight: 0.3
+    domains:
+      - avito.ru
