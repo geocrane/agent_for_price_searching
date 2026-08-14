@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from search_agent import profile
-from search_agent.input import read_table
+from search_agent.input import explain_empty, read_table
 from search_agent.obs.journal import logs_dir
 from search_agent.obs.log import get_logger, new_run_id, setup_logging
 from . import usage_store
@@ -267,7 +267,10 @@ async def api_upload(file: UploadFile = File(...)):
         "mapping": res.mapping, "confidence": res.confidence,
         "headers": res.headers, "header_row": res.header_row, "sheet": res.sheet,
         "unmapped": res.unmapped,
-        "counts": {"total": len(res.items)},
+        "counts": {"total": len(res.items), "rows": res.rows_total},
+        # Пустой результат обязан объяснять себя: иначе сбой чтения файла выглядит как поломка
+        # поиска. None — товары распознаны, показывать нечего.
+        "reason": explain_empty(res),
         "positions": positions,
     }
 

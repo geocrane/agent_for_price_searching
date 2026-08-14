@@ -52,6 +52,7 @@ class ReadResult:
     sheet: str | None = None
     unmapped: list[str] = field(default_factory=list)   # заголовки без сопоставления → raw
     confidence: str = "high"        # high | medium | low(needs_llm)
+    rows_total: int = 0             # непустых строк в файле (с заголовком) — для диагностики
 
 
 def _norm(s) -> str:
@@ -144,7 +145,11 @@ def _load_rows(path: Path, sheet: str | None):
     ext = path.suffix.lower()
     if ext in (".xlsx", ".xlsm", ".xltx"):
         import openpyxl
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        # read_only не берём намеренно: в потоковом режиме openpyxl доверяет объявленному в файле
+        # <dimension> и режет по нему и строки, и колонки. Экспортёры (напр. Яндекс Таблицы) пишут
+        # туда «A1» при полном листе — от таблицы оставалась одна ячейка и товары терялись целиком.
+        # Обычный режим считает границы по фактическим ячейкам и выравнивает строки по ширине.
+        wb = openpyxl.load_workbook(path, data_only=True)
         ws = wb[sheet] if sheet else wb.active
         rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
         name = ws.title
@@ -166,7 +171,7 @@ def read_table(path: str | Path, sheet: str | None = None,
     rows = [r for r in rows if any(_norm(c) for c in r)]     # выкинуть пустые строки
     if not rows:
         log.warning("Файл пуст или без данных: %s", path)
-        return ReadResult([], {}, [], 0, sheet_name, [], "low")
+        return ReadResult([], {}, [], 0, sheet_name, [], "low", 0)
 
     hdr_idx, hdr_score = _find_header_row(rows)
     has_header = hdr_score >= 1
@@ -214,8 +219,33 @@ def read_table(path: str | Path, sheet: str | None = None,
                for i, v in enumerate(row)}
         items.append(Item(row=first_data_row + offset, name=name, raw=raw))
 
-    log_event(log, "input.read.done", items=len(items), rows_total=len(data_rows))
-    return ReadResult(items, mapping, headers, header_row_num, sheet_name, unmapped, confidence)
+    log_event(log, "input.read.done", items=len(items), rows_data=len(data_rows),
+              rows_file=len(rows))
+    res = ReadResult(items, mapping, headers, header_row_num, sheet_name, unmapped, confidence,
+                     len(rows))
+    if not items:
+        log.warning("Товаров не распознано: %s", explain_empty(res))
+    return res
+
+
+def explain_empty(res: ReadResult) -> str | None:
+    """Почему в результате нет товаров. None — товары есть, объяснять нечего.
+
+    Единственный источник формулировки: её показывают и веб, и CLI. Без неё пустой результат
+    выглядел как поломка поиска, хотя причина всегда в структуре файла.
+    """
+    if res.items:
+        return None
+    if not res.rows_total:
+        return "файл пуст: в нём нет ни одной непустой строки"
+    if res.confidence == "low":
+        seen = [h for h in res.headers if h]
+        hint = (", заголовки: %s" % ", ".join(seen)) if seen else ""
+        return ("колонка с наименованием не распознана (прочитано строк: %d%s)"
+                % (res.rows_total, hint))
+    if res.header_row and res.rows_total <= res.header_row:
+        return "в файле только строка заголовка — строк с товарами нет"
+    return ("прочитано строк: %d, но ни в одной нет непустого наименования" % res.rows_total)
 
 
 def llm_mapping_request(headers: list[str], sample_rows: list[list]) -> list[dict]:

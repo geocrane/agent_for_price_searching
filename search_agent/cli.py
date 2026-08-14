@@ -59,7 +59,7 @@ def tools() -> None:
 @click.option("--limit", default=15, help="сколько позиций показать")
 def read(path: str, sheet: str | None, limit: int) -> None:
     """Адаптивно прочитать таблицу (Excel/CSV) и показать распознанные позиции."""
-    from .input import read_table
+    from .input import explain_empty, read_table
     from .input.normalize import extract_codes
     res = read_table(path, sheet=sheet)
     click.echo("Файл: %s | лист: %s | заголовок в строке %d | уверенность: %s"
@@ -67,10 +67,13 @@ def read(path: str, sheet: str | None, limit: int) -> None:
     click.echo("Колонки: %s" % (res.mapping or "не распознаны"))
     if res.unmapped:
         click.echo("Незамапленные заголовки (уйдут в raw/отчёт): %s" % ", ".join(res.unmapped))
-    if res.confidence == "low":
-        click.echo(click.style("  ⚠ структура неоднозначна — нужна дизамбигуация моделью "
-                               "(input.excel_reader.llm_mapping_request)", fg="yellow"))
     click.echo("\nТоваров: %d (показываю до %d)\n" % (len(res.items), limit))
+    reason = explain_empty(res)
+    if reason:      # пустой результат всегда называет причину — она же уходит в веб-интерфейс
+        click.echo(click.style("  ⚠ %s" % reason, fg="yellow"))
+        if res.confidence == "low":
+            click.echo(click.style("    подсказать колонку модели: "
+                                   "input.excel_reader.llm_mapping_request", fg="yellow"))
     for it in res.items[:limit]:
         codes = extract_codes(it.name, it.part_number or "")
         click.echo("  r%-3d %s" % (it.row, (it.name[:72] or "—")))

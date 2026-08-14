@@ -169,9 +169,10 @@ function renderUpload(d) {
 function _renderUpload(d) {
   // Плашка молчит, пока файл разобран нормально: «Колонки: name / Уверенность: средняя /
   // Заголовок: строка 0 / Лист: Sheet1» ничего не решали и занимали место у таблицы.
-  // Остаётся единственное, что требует действия: наименование не распознано.
-  if (d.confidence === "low") {
-    els.mapSummary.innerHTML = `<span class="chip warn">⚠ колонка с наименованием не распознана — структуру уточнит модель</span>`;
+  // Остаётся единственное, что требует действия: из файла не вышло ни одного товара — сервер
+  // присылает готовую причину (пустой файл, только заголовок, колонка не распознана).
+  if (d.reason) {
+    els.mapSummary.innerHTML = `<span class="chip warn">⚠ товары не распознаны: ${esc(d.reason)}</span>`;
     els.mapSummary.hidden = false;
   } else {
     els.mapSummary.innerHTML = ""; els.mapSummary.hidden = true;
@@ -181,7 +182,7 @@ function _renderUpload(d) {
   els.posBody.innerHTML = "";
   posRows = {}; posCandidates = {}; srcFound = 0;
   if (!d.positions.length) {
-    els.posBody.innerHTML = `<tr class="empty-row"><td colspan="7">Товары не распознаны.</td></tr>`;
+    els.posBody.innerHTML = `<tr class="empty-row"><td colspan="7">Товары не распознаны${d.reason ? " — " + esc(d.reason) : "."}</td></tr>`;
   }
   d.positions.forEach((p, i) => makePosRow(p, i + 1));
   els.cTotal.textContent = d.counts.total;
