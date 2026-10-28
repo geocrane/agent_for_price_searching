@@ -2,7 +2,6 @@
 """Задача агента (§9): first-class объект с жизненным циклом и приоритетом.
 
 kind — что делать (discover|fetch|inspect|find_link|escalate|extract|adjudicate|report_gap|chat…);
-uses_model — нужна ли полоса модели (тогда задача идёт через сериализующую очередь);
 agent_id — контекст/подагент (на будущее, для раздельных тредов). Приоритет: меньше = раньше.
 """
 import itertools
@@ -34,7 +33,6 @@ class AgentTask:
     agent_id: str = "default"
     row: int | None = None
     priority: int = Priority.NORMAL
-    uses_model: bool = False
     payload: dict = field(default_factory=dict)
 
     id: str = ""
@@ -55,6 +53,6 @@ class AgentTask:
     def event(self) -> dict:
         """Событие `task` для UI (панель очереди + таймлайн шагов)."""
         return {"type": "task", "id": self.id, "kind": self.kind, "agent_id": self.agent_id,
-                "row": self.row, "priority": self.priority, "uses_model": self.uses_model,
+                "row": self.row, "priority": self.priority,
                 "state": self.state.value, "error": self.error,
                 "started": self.started, "finished": self.finished}

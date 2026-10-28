@@ -243,15 +243,21 @@ FETCH_PRESETS: dict[str, dict] = {
     "basic":  {"backend": "browser", "real_chrome": True, "anti_detect": False, "headed": False,
                "persistent_profile": False, "warmup": True, "human_input": False,
                "http_first": True, "delay_range": [8.0, 25.0]},
+    # Человеческого ввода здесь НЕТ намеренно: окно headless, имитировать движения мыши не для
+    # кого, а его побочный эффект — принудительный concurrency=1 (см. normalize_fetch) — молча
+    # превращал «усиленный» режим в загрузку по одному сайту за раз.
     "strong": {"backend": "browser", "real_chrome": True, "anti_detect": True, "headed": False,
-               "persistent_profile": True, "warmup": True, "human_input": True,
+               "persistent_profile": True, "warmup": True, "human_input": False,
                "http_first": True, "delay_range": [8.0, 25.0]},
     # На максимуме лёгкий путь ВЫКЛЮЧЕН намеренно: режим выбирают ради куки-профиля и реального
     # окна, а httpx-запрос идёт мимо них — на тяжёлых сайтах он только подсветит нас лишним
     # обращением без куков.
+    # Человеческий ввод из максимума тоже убран: он тянул за собой concurrency=1, и самый
+    # сильный режим оказывался самым медленным — сайты открывались строго по одному. Кому нужен
+    # курсор, берёт пресет `cursor` ниже или ставит галочку руками.
     "max":    {"backend": "browser", "real_chrome": True, "anti_detect": True, "headed": True,
-               "persistent_profile": True, "warmup": True, "human_input": True,
-               "http_first": False, "delay_range": [12.0, 30.0]},
+               "persistent_profile": True, "warmup": True, "human_input": False,
+               "http_first": False, "concurrency": 4, "delay_range": [12.0, 30.0]},
     # Два «слоя» параллельности (ортогональны лесенке fast→max — выбираются по задаче):
     # swarm  — пачка вкладок РАЗНЫХ доменов разом, БЕЗ курсора (быстро; мышь не имитируем, чтобы
     #          широкая параллель не ломала человекоподобность). В один домен — всё равно по одному.
@@ -404,6 +410,10 @@ class AdjudicateConfig(BaseModel):
     # когда отсев по единице выбрасывает единственную точную цену (LTV RTM-085: 25500 ₽ за «шт»
     # проиграли двум аналогам за «шт.» и выпали из отчёта).
     unit_by_exact: bool = True
+    # Валюта отчёта. Цены в других валютах в итог не идут: конверсию мы не делаем, а число без
+    # знака валюты в колонке «Цена» читается как рубли — 104 $ за телефон выглядели как 104 ₽.
+    # Пустая строка — прежнее поведение: берётся валюта большинства найденных цен.
+    base_currency: str = "RUB"
 
 
 @lru_cache(maxsize=1)
@@ -462,7 +472,6 @@ class AgentConfig(BaseModel):
     # Точечные переопределения по этапу (пусто = у всех stage_positions). Пример: если замер
     # покажет, что модель простаивает — {"extract": 8}, чтобы исполнителю модели хватало работы.
     stage_positions_by_kind: dict[str, int] = Field(default_factory=dict)
-    model_lanes: int = 1               # полос модельной очереди оркестратора (модель серийна)
 
 
 class ResearchConfig(BaseModel):

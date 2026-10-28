@@ -21,12 +21,24 @@ _MATCH = {"точное": MatchType.EXACT, "аналог": MatchType.ANALOG}
 
 
 def _fetch_of(cand: dict) -> dict | None:
-    """Взять результат fetch из кандидата или из дискового кэша по URL."""
+    """Взять результат fetch из кандидата или из дискового кэша.
+
+    `fetch_key` — ФАКТИЧЕСКИЙ адрес, под которым страница легла в кэш: он отличается от
+    `url` после редиректа, при ручном заборе (человек пришёл на карточку своим путём) и при
+    эскалации на служебный endpoint маркетплейса. Без него добор непроверенных цен искал бы
+    страницу по исходному адресу и не находил.
+    """
     fetch = cand.get("fetch")
     if fetch:
         return fetch
     from ..fetch import cache
-    return cache.get(cand.get("url", ""))
+    for key in (cand.get("fetch_key"), cand.get("url", "")):
+        if not key:
+            continue
+        rec = cache.get(key)
+        if rec:
+            return rec
+    return None
 
 
 def _domain(cand: dict, url: str) -> str:
@@ -536,7 +548,21 @@ def pick_on_request(candidates: list[dict]) -> dict | None:
     Применяется, когда числовой цены по позиции нет: товар-то найден, просто продавец не
     публикует цифру. Для пользователя это НЕ «не найдено».
     """
-    found = [c["on_request"] for c in candidates or [] if c.get("on_request")]
+    found = []
+    for c in candidates or []:
+        raw = c.get("on_request")
+        if not raw:
+            continue
+        if isinstance(raw, dict):
+            found.append(raw)
+        else:
+            # Восстановленная сессия: словарь схлопнут в флаг (`session.summarize_cand` хранит
+            # только True/False, а подробности переезжают в поля слепка). Собираем запись обратно
+            # из них — иначе повторный свод по такой сессии падал, и «цена по запросу»
+            # превращалась в «ошибку свода».
+            found.append({"found": c.get("found") or "", "match": c.get("match") or "",
+                          "note": c.get("comment") or c.get("note") or "",
+                          "domain": c.get("domain") or "", "url": c.get("url") or ""})
     if not found:
         return None
     return min(found, key=lambda r: 0 if r.get("match") == "точное" else 1)
@@ -579,8 +605,22 @@ def infer_not_found_reason(candidates: list[dict]) -> "NotFoundReason | None":
     неоднозначно (цены на страницах были, но товар не подтверждён), не искали (ничего не грузили).
     """
     attempted = [c for c in candidates if not c.get("is_file")]
+    # Цены нашлись, но ни одной в валюте отчёта: это не «нет офферов» — предложения были, просто
+    # чужие деньги. Пользователь должен видеть настоящую причину, иначе пойдёт искать там, где
+    # уже искали.
+    found_prices = [p for c in attempted for p in (c.get("prices") or [])]
+    if found_prices:
+        from ..config import default_adjudicate_config
+        base = getattr(default_adjudicate_config(), "base_currency", "") or ""
+        if base and all((p.get("currency") or base) != base for p in found_prices):
+            return NotFoundReason.OTHER_CURRENCY
     fetched = [c for c in attempted if c.get("inspect") or c.get("fetch")]
     if not fetched:
+        # Страницы не грузили, потому что их домены под антиботом, — это «заблокировано», а не
+        # «не искали»: искали, но не пустили ещё на входе (ждут ручного открытия).
+        from .. import session as _sess
+        if any(c.get("status") == _sess.STATUS_MANUAL_WAIT for c in attempted):
+            return NotFoundReason.BLOCKED
         return NotFoundReason.NOT_SEARCHED
     inspects = [c.get("inspect") for c in attempted if c.get("inspect")]
     if not inspects:

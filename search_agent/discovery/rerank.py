@@ -3,6 +3,10 @@
 
 `sources.yaml` — рейтинг/приоритет, НЕ белый список: незнакомый домен получает
 `default_weight` и НЕ исключается; blacklist → 0 (отбрасываем). Дедуп по URL.
+
+Поверх общего рейтинга ложится профиль пользователя (`profile.apply_to_settings`): приоритетные
+домены, пониженные (вес урезан, но кандидат остаётся) и зоны — разрешённые/запрещённые. Зона
+проверяется в обеих формах, юникод и punycode: выдача отдаёт `xn--p1ai`, а человек пишет «рф».
 """
 import re
 
@@ -11,18 +15,57 @@ from ..models import Candidate
 _WORD = re.compile(r"\w+", re.U)
 
 
+# Во сколько раз урезается вес «пониженного» домена. Не ноль намеренно: пониженный — это
+# «смотрим в последнюю очередь и верим меньше», а не «выбрасываем» (для выбрасывания есть
+# отдельный уровень «запрещён»).
+LOWERED_FACTOR = 0.3
+
+
+def _hit(domain: str, patterns) -> bool:
+    """Домен совпадает с записью списка: он сам или его поддомен.
+
+    ТОЛЬКО так, без проверки на подстроку: раньше `d in domain` означало, что `ozon.ru` в чёрном
+    списке заодно выбрасывает `notozon.ru.example.com`, а после переезда управления доменами в
+    интерфейс таких правил становятся сотни и цена ошибки растёт.
+    """
+    for raw in patterns or []:
+        d = str(raw).strip().lower().removeprefix("www.")
+        if d and (domain == d or domain.endswith("." + d)):
+            return True
+    return False
+
+
+def _zone_allowed(domain: str, sources: dict) -> bool:
+    """Проходит ли домен по зонам профиля. Пустой список разрешённых = ограничения нет."""
+    zone = domain.rsplit(".", 1)[-1] if "." in domain else ""
+    if not zone:
+        return True
+    if zone in set(sources.get("banned_tlds") or []):
+        return False
+    allowed = set(sources.get("allowed_tlds") or [])
+    return not allowed or zone in allowed
+
+
 def source_weight(domain: str, sources: dict) -> tuple[float, int]:
-    """(вес, тир) домена по sources.yaml. Незнакомый → default_weight/тир 0; blacklist → 0."""
-    domain = (domain or "").lower()
+    """(вес, тир) домена по sources.yaml + профилю пользователя.
+
+    Незнакомый → default_weight/тир 0; blacklist, запрещённая зона → 0 (кандидат отбрасывается
+    в `rerank`); пониженный → вес урезается множителем, но остаётся положительным.
+    """
+    domain = (domain or "").lower().removeprefix("www.")
     default = float(sources.get("default_weight", 0.3))
-    if domain in set(sources.get("blacklist") or []):
+    if _hit(domain, sources.get("blacklist")):
         return 0.0, 0
+    if not _zone_allowed(domain, sources):
+        return 0.0, 0
+    weight, tier_no = default, 0
     for tier, info in (sources.get("tiers") or {}).items():
-        for d in (info.get("domains") or []):
-            d = str(d).lower()
-            if domain == d or domain.endswith("." + d) or d in domain:
-                return float(info.get("weight", default)), int(tier)
-    return default, 0
+        if _hit(domain, info.get("domains")):
+            weight, tier_no = float(info.get("weight", default)), int(tier)
+            break
+    if _hit(domain, sources.get("lowered")):
+        weight = max(weight * LOWERED_FACTOR, 0.01)   # положительный: это не выбрасывание
+    return weight, tier_no
 
 
 def name_tokens(name: str) -> set[str]:

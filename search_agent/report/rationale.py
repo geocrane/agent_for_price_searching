@@ -9,6 +9,7 @@
 чтобы ячейка не была пустой (правило «ничего не произошло недопустимо»). Реальный вызов
 модели инициирует пользователь (правило проекта); здесь только сборка промпта и разбор.
 """
+import asyncio
 from urllib.parse import urlparse
 
 from .xlsx import money, norm_verdict
@@ -302,3 +303,40 @@ async def write_rationale(item: dict, llm_client=None, *, model=None, cfg=None,
         text = fallback_rationale(item, nv, offers, include_excluded=cfg.include_excluded)
         return {"text": text, "usage": None, "degraded": True,
                 "by": "сводка (%s)" % _why(exc)}
+
+
+async def write_rationale_safe(item: dict, *, llm_client=None, model=None, cfg=None,
+                               emit=None) -> dict:
+    """Комментарий по позиции с таймаутом и запасной сводкой; пишет его прямо в `item`.
+
+    Комментарий — не цена: залипший или упавший вызов не имеет права задерживать позицию,
+    поэтому есть таймаут, а при любом отказе берётся детерминированная сводка по источникам
+    (пустой ячейки в отчёте быть не должно).
+
+    Общая для прогона (`agent/run.py`) и для доразбора вручную открытой страницы
+    (`session.status_for_prices`): комментарий об одном и том же наборе источников обязан звучать
+    одинаково, откуда бы его ни запустили.
+    """
+    from ..config import ReportConfig
+    cfg = cfg or ReportConfig()
+    row = item.get("row")
+    timeout = float(getattr(cfg, "rationale_timeout", 60.0))
+    try:
+        async with asyncio.timeout(timeout):
+            r = await write_rationale(item, llm_client=llm_client, model=model, cfg=cfg)
+    except TimeoutError:              # отмену прогона НЕ перехватываем — она должна пройти дальше
+        nv = norm_verdict(item.get("verdict"))
+        log.warning("Комментарий по позиции r%s не дождались (%.0fс) — беру сводку по источникам",
+                    row, timeout)
+        r = {"text": fallback_rationale(item, nv, offers_from_item(item, limit=cfg.max_offers_in_comment),
+                                        include_excluded=cfg.include_excluded),
+             "usage": None, "degraded": True, "by": "сводка (таймаут %.0f с)" % timeout}
+    item["rationale"] = r["text"]
+    item["rationale_by"] = r.get("by") or ("сводка" if r.get("degraded") else "модель")
+    if emit is not None:
+        from ..extract import _emit
+        if r.get("usage"):
+            await _emit(emit, {"type": "usage_delta", "usage": r["usage"], "row": row})
+        await _emit(emit, {"type": "rationale", "row": row, "text": r["text"],
+                           "degraded": r["degraded"], "by": item["rationale_by"]})
+    return r

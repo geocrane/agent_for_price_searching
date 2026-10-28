@@ -55,6 +55,12 @@ class Session:
         self.extract_task = None       # фоновая задача извлечения цен (M4)
         self.run2_task = None          # фоновая задача прогона «Найти» / оркестрированного (M7/M8)
         self.orchestrated = None       # текущий OrchestratedRun (для стопа всей цепочки)
+        self.run_kind: str = ""        # "find" — кнопка «Найти», "manual" — продолжение по блокировкам
+        # «Режим открытия» и «сценарий очистки» живут в localStorage браузера, но прогон могут
+        # начать не только кнопкой «Найти» (ещё и ручное открытие блокировки) — тогда сервер
+        # обязан знать выбор пользователя сам. Фронт присылает его вместе с запросами.
+        self.ui_opts: dict | None = None
+        self.ui_clean_opts: dict | None = None
         self.react_task = None         # фоновая задача ReAct-прогона (M6)
         # --- чат-исследователь (M9): отдельная от прогона по таблице способность ---
         self.chat_store = None         # ChatStore (runs/chats.sqlite), ленивая инициализация
@@ -85,7 +91,8 @@ def _persist_session(force: bool = False) -> None:
     _last_persist["t"] = now
     try:
         from search_agent import session as sess
-        sess.save_session(session.items, filename=session.last_filename)
+        sess.save_session(session.items, filename=session.last_filename,
+                          headers=_checkpoint["headers"])
     except Exception as exc:  # noqa: BLE001 — персист не должен ронять прогон
         log.warning("Не удалось сохранить сессию: %s", exc)
 
@@ -168,8 +175,9 @@ async def _startup():
             log.info("Восстановлена прошлая сессия: файл=%s, товаров=%d",
                      session.last_filename or "—", len(session.items))
             # Продолжение прерванной работы — это новый прогон: заводим ему свою папку, чтобы
-            # результаты прошлой попытки остались нетронутыми (заголовки берём из сохранённых строк).
-            _checkpoint_reset(session.last_filename or "позиции")
+            # результаты прошлой попытки остались нетронутыми. Заголовки исходного файла теперь
+            # лежат в самой сессии, поэтому порядок колонок «Сводной» переживает перезапуск.
+            _checkpoint_reset(session.last_filename or "позиции", headers=data.get("headers"))
     except Exception as exc:  # noqa: BLE001
         log.warning("Не удалось восстановить сессию: %s", exc)
     log.info("webui запущен (локальный режим)")
@@ -338,7 +346,8 @@ async def api_report(req: ReportRequest):
     started = _time.monotonic()
     try:
         summary = await build_report(items, path, cfg=settings.report, emit=_usage_emit,
-                                     llm_client=llm)
+                                     llm_client=llm, headers=_checkpoint["headers"],
+                                     source_filename=session.last_filename or "")
         _persist_session(force=True)                 # сохранить добавленные комментарии (rationale)
         with open(path, "rb") as f:
             data = f.read()
@@ -490,11 +499,14 @@ async def api_model_select(req: ModelSelectRequest):
 @app.get("/api/session")
 async def api_session():
     """Текущая сессия для восстановления UI при открытии (товары + кандидаты + статусы + своды)."""
+    from search_agent import session as sess
     run = session.orchestrated
     # started_at идущего прогона — чтобы после перезагрузки страницы таймер продолжил счёт
     # с правильного момента, а не начал с нуля.
+    # has_saved — есть ли файл прогресса на диске. Отдельно от `items`: файл бывает пустым, и
+    # тогда стирать его нечего в памяти, но есть на диске (см. session.has_saved_session).
     return {"ok": True, "filename": session.last_filename, "items": session.items,
-            "running": run is not None,
+            "running": run is not None, "has_saved": sess.has_saved_session(),
             "started_at": run.timer.started if run is not None else None}
 
 
@@ -531,6 +543,9 @@ class ProfileRequest(BaseModel):
     second_page_if_empty: bool | None = None
     strict_analog: bool | None = None
     enough_confirmations: int | None = None
+    domain_ratings: dict[str, str] | None = None   # домен → preferred|normal|lowered|banned
+    allowed_tlds: list[str] | None = None
+    banned_tlds: list[str] | None = None
 
 
 @app.get("/api/profile")
@@ -566,6 +581,97 @@ class FindRequest(BaseModel):
     budgets: dict | None = None        # {escalate_per_row, find_link_per_row, extra_pages_per_row}
 
 
+# Сколько прогон-продолжение ждёт новой работы, прежде чем свернуться (сек). Человек кликает
+# домены не подряд: между кликами он проходит проверку в окне, и прогон обязан это переждать,
+# иначе на каждый клик поднимался бы новый браузер. Минуты не хватало: пока человек разбирался
+# с одной капчей, прогон сворачивался целиком — с досведением и переспросом модели, — а
+# следующий клик поднимал всё заново. Пока открыто хоть одно ручное окно, прогон вообще не
+# уходит в хвост (см. `keep_alive` в OrchestratedRun.run_open).
+MANUAL_IDLE_GRACE = 600.0
+
+
+async def _start_run(*, idle_grace: float | None = None, opts: dict | None = None,
+                     clean_opts: dict | None = None, affix: str | None = None,
+                     use_llm_queries: bool | None = None, model: str | None = None,
+                     base_url: str | None = None, budgets: dict | None = None,
+                     engine: str = "find"):
+    """Поднять прогон по товарам сессии и вести его в фоне. Возвращает (run, transport).
+
+    ОДИН вход для обоих способов начать работу: кнопка «Найти» (`idle_grace=None` — прогон
+    обходит все позиции и заканчивается, когда очередь опустела) и ручное открытие блокировки
+    (`idle_grace` задан — прогон переживает пустую очередь и ждёт новую работу). У ручного пути
+    раньше был СВОЙ последовательный конвейер: страница за страницей, каждая с ожиданием модели.
+    Теперь очередь, лимиты вкладок и полоса модели у них общие.
+    """
+    from search_agent.agent import OrchestratedRun
+    from search_agent.config import load_settings, resolve_clean, resolve_fetch
+    from search_agent.fetch.fetcher import Fetcher
+    settings = load_settings()
+    settings.fetch = resolve_fetch(settings.fetch, opts)      # движок читает concurrency/human_input отсюда
+    settings.clean = resolve_clean(settings.clean, clean_opts)
+    # «Кандидатов на товар» из настроек интерфейса — это ограничение ВЫДАЧИ: 0 = рассматриваем
+    # всю (по умолчанию), иначе ранжируем и берём топ-N. Иначе поле ни на что не влияло.
+    settings.discovery.top_n = max(0, int(settings.fetch.top_n_fetch or 0))
+    # Профиль поиска пользователя: аффикс и приоритеты источников под ЕГО тип товаров. Что явно
+    # передано в запросе — важнее сохранённого профиля (разовая правка не портит настройку).
+    prof = profile.load_active(settings.storage)
+    profile.apply_to_settings(prof, settings)
+    affix = affix if affix is not None else prof.affix
+    use_llm_queries = use_llm_queries if use_llm_queries is not None else prof.use_llm_queries
+    llm, transport = _make_llm(settings, base_url=base_url)
+    conc = 1 if settings.fetch.human_input else settings.fetch.concurrency
+    log.info("%s: транспорт=%s, товаров=%d, режим=%s, вкладок=%d, человеч.ввод=%s, "
+             "позиций на этапе=%d",
+             "Продолжение по блокировкам" if idle_grace is not None else "Найти",
+             transport, len(session.items), settings.fetch.backend, conc,
+             settings.fetch.human_input, settings.agent.stage_positions)
+
+    # Подготовка прогона может упасть (браузер не стартовал, нет Chrome, кривой конфиг). Клиент
+    # модели при этом уже создан — не закрыв его, мы утекаем соединением на каждой неудаче.
+    try:
+        fetcher = await Fetcher(settings.fetch, settings.clean).start()
+        # Обнаружение встроено в движок как стадия задач: по мере нахождения источников по товару
+        # СРАЗУ стартует его загрузка/извлечение параллельно с поиском по остальным (пайплайн).
+        run = OrchestratedRun(session.items, settings=settings, fetcher=fetcher, llm_client=llm,
+                              model=model, emit=_find_emit, budgets=budgets, affix=affix,
+                              use_llm_queries=use_llm_queries, max_pages=prof.max_pages,
+                              enough_confirmations=prof.enough_confirmations)
+    except Exception:
+        await _close_llm(llm)
+        raise
+    session.orchestrated = run
+    session.run_kind = "manual" if idle_grace is not None else "find"
+    # Общее время задачи считается от начала прогона. Отдаём фронту абсолютную отметку, а не
+    # «прошло N секунд»: так таймер переживает перезагрузку страницы и переподключение сокета.
+    broadcaster.publish({"type": "run_started", "engine": engine, "started_at": run.timer.started})
+
+    async def _drive():
+        try:
+            if idle_grace is not None:
+                from search_agent.fetch.manual import SESSION as _manual
+                await run.run_open(idle_grace, keep_alive=lambda: bool(_manual.open_urls()))
+            else:
+                await run.run()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.error("Прогон (%s): ошибка: %s", engine, exc, exc_info=True)
+        finally:
+            await fetcher.close()
+            await _close_llm(llm)
+            session.orchestrated = None
+            session.run_kind = ""
+            _persist_session(force=True)
+            # Финальное сохранение обязательно и здесь: прогон мог закончиться на позиции, не
+            # кратной шагу, или быть остановлен кнопкой «Стоп» — последняя работа не должна
+            # остаться только в сессии.
+            await _checkpoint_save("конец прогона")
+            broadcaster.publish({"type": "run_done", "engine": engine})
+
+    session.run2_task = asyncio.create_task(_drive())
+    return run, transport
+
+
 @app.post("/api/find")
 async def api_find(req: FindRequest):
     """Единая кнопка «Найти»: агент сам ведёт весь пайплайн по товарам сверху вниз (проблема №1).
@@ -576,70 +682,145 @@ async def api_find(req: FindRequest):
     """
     if not session.items:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Сначала загрузите файл."})
+    session.ui_opts, session.ui_clean_opts = req.opts, req.clean_opts
     if session.orchestrated is not None:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Поиск уже идёт — дождитесь или нажмите «Стоп»."})
+        # Продолжение по блокировкам — не повод отказывать: «Найти» подберёт ту же работу и
+        # ещё всю остальную. Отказ здесь выглядел бы как «инструмент занят непонятно чем».
+        if session.run_kind != "manual":
+            what = ("Переизвлечение моделью идёт" if session.run_kind == "refill"
+                    else "Поиск уже идёт")
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "%s — дождитесь или нажмите «Стоп»." % what})
+        log.info("«Найти» поверх продолжения по блокировкам — сворачиваю продолжение")
+        await _stop_run()
     new_run_id()
-    from search_agent.agent import OrchestratedRun
-    from search_agent.config import load_settings, resolve_clean, resolve_fetch
-    from search_agent.fetch.fetcher import Fetcher
-    settings = load_settings()
-    settings.fetch = resolve_fetch(settings.fetch, req.opts)      # движок читает concurrency/human_input отсюда
-    settings.clean = resolve_clean(settings.clean, req.clean_opts)
-    # «Кандидатов на товар» из настроек интерфейса — это ограничение ВЫДАЧИ: 0 = рассматриваем
-    # всю (по умолчанию), иначе ранжируем и берём топ-N. Иначе поле ни на что не влияло.
-    settings.discovery.top_n = max(0, int(settings.fetch.top_n_fetch or 0))
-    # Профиль поиска пользователя: аффикс и приоритеты источников под ЕГО тип товаров. Что явно
-    # передано в запросе — важнее сохранённого профиля (разовая правка не портит настройку).
-    prof = profile.load_active(settings.storage)
-    profile.apply_to_settings(prof, settings)
-    affix = req.affix if req.affix is not None else prof.affix
-    use_llm_queries = req.use_llm_queries if req.use_llm_queries is not None else prof.use_llm_queries
-    llm, transport = _make_llm(settings, base_url=req.base_url)
-    conc = 1 if settings.fetch.human_input else settings.fetch.concurrency
-    log.info("Найти: транспорт=%s, товаров=%d, режим=%s, вкладок=%d, человеч.ввод=%s, "
-             "позиций на этапе=%d",
-             transport, len(session.items), settings.fetch.backend, conc,
-             settings.fetch.human_input, settings.agent.stage_positions)
-
-    # Подготовка прогона может упасть (браузер не стартовал, нет Chrome, кривой конфиг) — это
-    # НЕ повод отдавать 500 без объяснения: возвращаем причину текстом, прогон не начат.
     try:
-        fetcher = await Fetcher(settings.fetch, settings.clean).start()
-        # Обнаружение встроено в движок как стадия задач: по мере нахождения источников по товару
-        # СРАЗУ стартует его загрузка/извлечение параллельно с поиском по остальным (пайплайн).
-        run = OrchestratedRun(session.items, settings=settings, fetcher=fetcher, llm_client=llm,
-                              model=req.model, emit=_find_emit, budgets=req.budgets, affix=affix,
-                              use_llm_queries=use_llm_queries, max_pages=prof.max_pages,
-                              enough_confirmations=prof.enough_confirmations)
-    except Exception as exc:  # noqa: BLE001
+        _run, transport = await _start_run(
+            opts=req.opts, clean_opts=req.clean_opts, affix=req.affix,
+            use_llm_queries=req.use_llm_queries, model=req.model, base_url=req.base_url,
+            budgets=req.budgets, engine="find")
+    except Exception as exc:  # noqa: BLE001 — причину показываем текстом, а не молчаливым 500
         log.error("Найти: не удалось начать прогон: %s", exc, exc_info=True)
         return JSONResponse(status_code=400, content={
             "ok": False, "error": "Не удалось начать поиск — %s: %s" % (type(exc).__name__, exc)})
+    return {"ok": True, "transport": transport, "count": len(session.items)}
+
+
+# ---- Переизвлечение моделью по кэшу страниц ---------------------------------
+# Прогон, у которого посреди работы отвалилась модель, оставляет цены «не проверено моделью» и
+# сайты с причиной «модель недоступна». Поиск за них уже оплачен, страницы лежат в
+# runs/fetch_cache — повторять весь путь незачем. Здесь отдельный запуск: только модель.
+
+
+PREFLIGHT_TIMEOUT = 45.0            # с; предполётная проверка модели перед переизвлечением
+
+
+def _refill_targets(rows: set | None = None) -> dict:
+    """Сколько страниц ждёт повторного разбора моделью: {pages, rows, missing}."""
+    from search_agent import session as sess
+    todo, missing = sess.pending_model_pages(session.items, rows)
+    return {"pages": len(todo), "rows": len({it["row"] for it, _ in todo}), "missing": missing}
+
+
+@app.get("/api/refill/preview")
+async def api_refill_preview():
+    """Числа для кнопки «Переизвлечь»: страниц, позиций и сколько страниц потеряно для кэша."""
+    return {"ok": True, "running": session.orchestrated is not None, **_refill_targets()}
+
+
+class RefillRequest(BaseModel):
+    rows: list[int] | None = None      # ограничить строками (проверка на нескольких позициях)
+    model: str | None = None
+    base_url: str | None = None
+
+
+@app.post("/api/refill")
+async def api_refill(req: RefillRequest):
+    """Переизвлечь цены моделью по страницам из кэша: без поиска, без браузера, без сети.
+
+    Предполётная проверка модели обязательна: без неё запуск на тысячах страниц просто повторил
+    бы деградацию — те же «не проверено моделью», только ещё раз и за те же деньги.
+    """
+    if not session.items:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "Нет сохранённой работы: сначала загрузите файл и выполните поиск."})
+    if session.orchestrated is not None:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "Прогон уже идёт — дождитесь или нажмите «Стоп»."})
+    rows = set(req.rows) if req.rows else None
+    target = _refill_targets(rows)
+    if not target["pages"]:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "Переизвлекать нечего: все страницы уже разобраны моделью."})
+
+    from search_agent.config import load_settings
+    from search_agent.ops.selftest import check_model
+    settings = load_settings()
+    if req.base_url:
+        settings.llm.base_url = req.base_url
+    if req.model:
+        settings.llm.model = req.model
+    log.info("Переизвлечение: проверяю связь с моделью перед запуском (%d страниц)", target["pages"])
+    # Проверяем ТОЛЬКО модель: поиск здесь не участвует, и тратить на него запрос квоты незачем.
+    # Проверка под своим сроком: у клиента модели есть повторы с ожиданием (llm/limits.py), и на
+    # недоступном сервере она уходит в минуты — а человек в это время смотрит на нажатую кнопку.
+    try:
+        check = await asyncio.wait_for(check_model(settings, emit=_usage_emit),
+                                       timeout=PREFLIGHT_TIMEOUT)
+    except asyncio.TimeoutError:
+        check = {"ok": False, "error": "нет ответа за %.0f с" % PREFLIGHT_TIMEOUT}
+    if not check["ok"]:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "Модель недоступна (%s) — переизвлечение не начинаю: оно просто "
+                                  "повторило бы «не проверено моделью». Проверьте связь кнопкой "
+                                  "«Проверка»." % (check.get("error") or "нет ответа")})
+    new_run_id()
+    try:
+        _run, transport = await _start_refill_run(rows, model=req.model, base_url=req.base_url)
+    except Exception as exc:  # noqa: BLE001 — причину показываем текстом, а не молчаливым 500
+        log.error("Переизвлечение: не удалось начать: %s", exc, exc_info=True)
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "Не удалось начать переизвлечение — %s: %s"
+                                  % (type(exc).__name__, exc)})
+    return {"ok": True, "transport": transport, **target}
+
+
+async def _start_refill_run(rows: set | None, *, model: str | None = None,
+                            base_url: str | None = None):
+    """Поднять прогон-переизвлечение и вести его в фоне. Возвращает (run, ярлык-транспорт).
+
+    Отличия от `_start_run`: НЕТ загрузчика (`fetcher=None`) — браузер здесь не нужен и не
+    поднимается, страницы берутся с диска; порог «достаточно подтверждений» выключен — иначе он
+    пометил бы уже разобранные сайты «не понадобился» посреди переспроса.
+    """
+    from search_agent.agent import OrchestratedRun
+    from search_agent.config import load_settings
+    settings = load_settings()
+    profile.apply_to_settings(profile.load_active(settings.storage), settings)
+    llm, transport = _make_llm(settings, base_url=base_url)
+    run = OrchestratedRun(session.items, settings=settings, fetcher=None, llm_client=llm,
+                          model=model, emit=_find_emit, max_pages=1, enough_confirmations=0)
     session.orchestrated = run
-    # Общее время задачи считается от нажатия «Найти». Отдаём фронту абсолютную отметку, а не
-    # «прошло N секунд»: так таймер переживает перезагрузку страницы и переподключение сокета.
-    broadcaster.publish({"type": "run_started", "engine": "find", "started_at": run.timer.started})
+    session.run_kind = "refill"
+    broadcaster.publish({"type": "run_started", "engine": "refill", "started_at": run.timer.started})
 
     async def _drive():
         try:
-            await run.run()
+            await run.run_refill(rows)
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
-            log.error("Найти: ошибка прогона: %s", exc, exc_info=True)
+            log.error("Переизвлечение: ошибка: %s", exc, exc_info=True)
         finally:
-            await fetcher.close()
             await _close_llm(llm)
             session.orchestrated = None
+            session.run_kind = ""
             _persist_session(force=True)
-            # Финальное сохранение обязательно и здесь: прогон мог закончиться на позиции, не
-            # кратной шагу, или быть остановлен кнопкой «Стоп» — последняя работа не должна
-            # остаться только в сессии.
-            await _checkpoint_save("конец прогона")
-            broadcaster.publish({"type": "run_done", "engine": "find"})
+            await _checkpoint_save("конец переизвлечения")
+            broadcaster.publish({"type": "run_done", "engine": "refill"})
 
     session.run2_task = asyncio.create_task(_drive())
-    return {"ok": True, "transport": transport, "count": len(session.items)}
+    return run, transport
 
 
 class DiscoverRequest(BaseModel):
@@ -735,6 +916,29 @@ def _usage_emit(ev: dict) -> None:
             cost = _cost_of(fields[0], fields[1])       # ₽ по ценам выбранной модели
             cumulative = usage_store.add(*fields, cost=cost, model=_current_model_id())
             broadcaster.publish({"type": "usage", "cumulative": cumulative})
+
+
+async def _stop_run() -> None:
+    """Свернуть идущий прогон и ДОЖДАТЬСЯ, пока он отпустит браузер.
+
+    Ждать обязательно: fetcher закрывается в `finally` фоновой задачи прогона, и если начать
+    следующий прогон раньше, два Chrome подерутся за один постоянный профиль
+    (`fetch/browser.py::_PROFILE_LEASE`).
+    """
+    run = session.orchestrated
+    if run is not None:
+        try:
+            await run.stop()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Стоп оркестратора: %s", exc)
+    task = session.run2_task
+    if task is not None and not task.done():
+        try:                                     # shield: по таймауту НЕ рвём чужой finally
+            await asyncio.wait_for(asyncio.shield(task), timeout=30)
+        except asyncio.TimeoutError:
+            log.warning("Прогон не свернулся за 30 с — продолжаю без ожидания")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.post("/api/stop")
@@ -947,15 +1151,193 @@ async def api_content(url: str):
 
 
 class ManualRequest(BaseModel):
-    url: str
+    url: str = ""
+    # «Режим открытия» и «сценарий очистки» живут в localStorage браузера. Прогон-продолжение
+    # запускается сервером сам (после забора страницы), поэтому выбор пользователя должен
+    # приехать сюда — иначе догрузка домена пошла бы не тем режимом, что выбран в интерфейсе.
+    opts: dict | None = None
+    clean_opts: dict | None = None
+
+
+# ---- Вручную открытая страница уходит в общую очередь прогона ----------------
+# Заблокированный источник терминален: повторное «Найти» к нему не вернётся, поэтому забор
+# страницы обязан сам поставить работу. Раньше это делалось ПОСЛЕДОВАТЕЛЬНО — под глобальным
+# локом, страница за страницей, каждая с ожиданием модели, а остальные страницы домена
+# догружались обычным `for`-циклом отдельного модуля доразбора. На реальной сессии это
+# 2247 ждущих страниц на 547 доменах, то есть десятки часов. Теперь и забранная страница, и
+# остальные страницы её домена — обычные задачи очереди: те же лимиты, та же параллельность,
+# та же кнопка «Стоп», та же вкладка «Очередь».
+
+_manual_run_lock = asyncio.Lock()   # два забора подряд не должны поднять два браузера
+
+
+async def _ensure_manual_run():
+    """Прогон, в который уходит работа после ручного открытия. Идущий — переиспользуем.
+
+    Идёт обычный поиск — отдаём его: работа встанет в ту же очередь с высоким приоритетом.
+    Прогона нет — поднимаем продолжение (`run_open`), которое переживает пустую очередь и ждёт
+    следующих кликов человека.
+    """
+    async with _manual_run_lock:
+        run = session.orchestrated
+        orch = getattr(run, "orch", None)
+        # `closing` спрашиваем наравне с `stopped`. Прогон, ушедший в хвост, ещё лежит в сессии
+        # (её обнуляет `finally` у `_drive`, то есть МИНУТЫ спустя), но очередь у него уже не
+        # обслуживается, а `fetcher` вот-вот закроется: поставленные туда задачи молча гибли —
+        # человек открывал страницу, и «ничего не происходило».
+        if run is not None and orch is not None and not orch.stopped and not run.closing:
+            # Переизвлечение идёт БЕЗ загрузчика: у него нет ни браузера, ни вкладок, и ручная
+            # страница в нём просто упала бы на `fetcher`. Своего прогона рядом тоже не поднимаем
+            # (два прогона по одним и тем же товарам), поэтому честно отказываем.
+            if session.run_kind == "refill":
+                raise RuntimeError("идёт переизвлечение моделью — дождитесь его или нажмите «Стоп»")
+            return run
+        opts = dict(session.ui_opts or {})
+        # Кука пройденной проверки лежит в ПОСТОЯННОМ профиле браузера — без него повтор
+        # страниц домена бессмыслен, какой бы режим ни выбрал пользователь. И по той же причине
+        # выключаем лёгкий путь: httpx ходит МИМО профиля, куки у него нет, поэтому он почти
+        # гарантированно получал блок, выдерживал ещё одну паузу по домену и только потом
+        # уступал браузеру — то есть удваивал ожидание и лишний раз «палил» домен.
+        opts.update({"backend": "browser", "persistent_profile": True, "http_first": False})
+        new_run_id()
+        run, _transport = await _start_run(idle_grace=MANUAL_IDLE_GRACE, opts=opts,
+                                           clean_opts=session.ui_clean_opts, engine="manual")
+        return run
+
+
+def _manual_emit(ev: dict) -> None:
+    """Событие ручного режима: в UI как раньше, а на «забрано» — работа уходит в очередь."""
+    broadcaster.publish(ev)
+    if ev.get("type") == "manual" and ev.get("state") == "grabbed":
+        asyncio.create_task(_queue_manual_page(ev.get("url", ""), ev.get("current")))
+
+
+def _positions_with_url(url: str) -> list[tuple[dict, dict]]:
+    """Пары (позиция, источник) для этого URL: один и тот же сайт бывает у нескольких товаров."""
+    from search_agent import session as sess
+    out = []
+    for it in session.items or []:
+        for cand in it.get("candidates", []) or []:
+            if sess.same_url(cand.get("url"), url) or sess.same_url(cand.get("fetch_key"), url):
+                out.append((it, cand))
+    return out
+
+
+async def _fail_manual(url: str, note: str, pairs: list[tuple[dict, dict]] | None = None) -> dict:
+    """Ручной забор не удалось поставить в работу — сказать об этом ВИДИМО, а не тостом.
+
+    Каждый отказ обязан осесть статусом на самом сайте. Иначе получается ровно то, на что
+    жаловался пользователь: страницу открыл, проверку прошёл, а она как была в «Блокировках»,
+    так и осталась, и почему — неизвестно.
+    """
+    from search_agent import session as sess
+    log.warning("Ручная страница не поставлена в работу (%s): %s", url, note)
+    for it, cand in pairs or []:
+        cand["status"] = sess.STATUS_ERROR
+        cand["result_note"] = note
+        broadcaster.publish({"type": "site_update", "row": it.get("row"),
+                             "url": cand.get("url"), "domain": cand.get("domain", ""),
+                             "status": sess.STATUS_ERROR, "note": note})
+    broadcaster.publish({"type": "manual", "url": url, "state": "analyze_failed", "note": note})
+    return {"ok": False, "error": note}
+
+
+async def _queue_manual_page(url: str, page_url: str | None = None) -> dict:
+    """Забранную страницу — на извлечение, остальные страницы её домена — в очередь загрузки.
+
+    Поток намеренно линейный и ровно такой, как его описывает интерфейс:
+
+      забрали страницу → поставили её на извлечение → если домен открыт ВПЕРВЫЕ, подняли
+      остальные его страницы; если это ПОВТОРНАЯ блокировка — не подняли ничего.
+
+    Раньше остальные страницы поднимались всегда. После повторной блокировки это отправляло
+    человека ждать ту самую автозагрузку, которая только что не прошла, — и домен возвращался
+    в «Блокировки» целиком, обесценивая только что пройденную проверку.
+    """
+    pairs = _positions_with_url(url)
+    if not pairs:
+        return await _fail_manual(
+            url, "страница не относится ни к одной позиции таблицы — разбирать нечего")
+    try:
+        run = await _ensure_manual_run()
+    except Exception as exc:  # noqa: BLE001 — фоновая задача не должна умирать молча
+        log.error("Не удалось поднять прогон для ручной страницы (%s): %s", url, exc, exc_info=True)
+        return await _fail_manual(url, "не удалось начать работу — %s: %s"
+                                       % (type(exc).__name__, exc), pairs)
+
+    queued = await run.submit_grabbed_page(url, page_url)
+    if not queued:
+        return await _fail_manual(
+            url, "страницы нет в кэше или она ещё под защитой — заберите её снова", pairs)
+
+    dom = (pairs[0][1].get("domain") or "").lower()
+    again = run.manual_domain_opened(dom)
+    rest = 0 if again else await run.unblock_domain(dom)
+    note = ("повторная блокировка %s: забрана только эта страница, остальные открывайте вручную"
+            % dom) if again else \
+           ("в очереди: эта страница и ещё %d стр. домена %s" % (rest, dom))
+    broadcaster.publish({"type": "manual", "url": url, "state": "queued", "note": note})
+    _persist_session(force=True)
+    log.info("Ручное открытие %s: на извлечение %d, домен %s — %s",
+             url, queued, dom, "повторная блокировка, остальные не трогаем" if again
+             else "в очередь %d стр." % rest)
+    return {"ok": True, "queued": queued, "domain_queued": rest, "reblocked": again}
+
+
+def _blocked_pages() -> list[dict]:
+    """Страницы, которые ждут человека: заблокированные и отложенные из-за антибота на домене.
+
+    ЭТО ЕДИНСТВЕННЫЙ ОТВЕТ НА ВОПРОС «что сейчас в блокировках». Раньше тот же вопрос решался
+    ещё и на клиенте, по своему снимку событий, и две реализации никогда не сверялись: стоило
+    оборваться сокету — и список на экране расходился с действительностью до перезагрузки
+    страницы.
+    """
+    from search_agent import session as sess
+    from search_agent.fetch.manual import SESSION as manual
+    out = []
+    for it in session.items or []:
+        for c in it.get("candidates", []) or []:
+            if c.get("is_file") or sess.cand_status(c) not in sess.UNBLOCKABLE:
+                continue
+            url = c.get("url") or ""
+            # Состояние ручного окна отдаём СТРОКОЙ СПИСКА. «Идёт проверка» жило только в общей
+            # строке статуса, которую перетирало любое следующее событие, — понять, что
+            # происходит с конкретной страницей, было нельзя.
+            st = manual.state_of(url) or {}
+            out.append({"row": it.get("row"), "name": it.get("name") or "",
+                        "domain": c.get("domain") or "", "url": url,
+                        "status": sess.cand_status(c), "reason": c.get("blocked") or "",
+                        "reblocked": bool(c.get("reblocked")),
+                        "manual_state": st.get("state") or "",
+                        "manual_note": st.get("note") or "",
+                        "note": sess.visible_note(c) or ""})
+    return out
+
+
+@app.get("/api/blocked")
+async def api_blocked():
+    """Список страниц, ждущих ручного открытия (вкладка «Блокировки»)."""
+    pages = _blocked_pages()
+    return {"ok": True, "pages": pages,
+            "domains": sorted({p["domain"] for p in pages if p["domain"]})}
+
+
+# Массового «повторить домен» (POST /api/domain/retry) здесь больше нет намеренно. Он перекидывал
+# все страницы домена в очередь без ручного открытия — то есть делал ровно то, что теперь
+# происходит само при первом успешном заборе, но в обход решения «первый раз или повторная
+# блокировка». Двух путей к одному действию быть не должно: во вкладке «Блокировки» осталось
+# одно действие — клик по странице открывает её. Вместе с ним ушёл и POST /api/recheck: он
+# дословно повторял тело `_queue_manual_page` и не вызывался ниоткуда.
 
 
 @app.post("/api/manual/open")
 async def api_manual_open(req: ManualRequest):
     """Открыть карточку в видимом окне нашего браузера + запустить авто-забор по прохождении проверки."""
     from search_agent.fetch.manual import SESSION
+    if req.opts is not None:          # запоминаем режим открытия, выбранный в интерфейсе
+        session.ui_opts, session.ui_clean_opts = req.opts, req.clean_opts
     try:
-        return await SESSION.open(req.url, emit=broadcaster.publish)
+        return await SESSION.open(req.url, emit=_manual_emit)
     except Exception as exc:  # noqa: BLE001
         log.error("Ручной режим open: %s", exc, exc_info=True)
         return JSONResponse(status_code=400, content={"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
@@ -965,13 +1347,13 @@ async def api_manual_open(req: ManualRequest):
 async def api_manual_grab(req: ManualRequest):
     """Забрать итоговую страницу сейчас (override; только если открыт тот же сайт)."""
     from search_agent.fetch.manual import SESSION
-    return await SESSION.grab(req.url, emit=broadcaster.publish)
+    return await SESSION.grab(req.url, emit=_manual_emit)
 
 
 @app.post("/api/manual/close")
 async def api_manual_close(req: ManualRequest):
     from search_agent.fetch.manual import SESSION
-    return await SESSION.close(req.url or None, emit=broadcaster.publish)   # пустой url → закрыть всё
+    return await SESSION.close(req.url or None, emit=_manual_emit)   # пустой url → закрыть всё
 
 
 @app.get("/api/usage")
@@ -1107,6 +1489,85 @@ async def api_chat_stop(chat_id: str):
     log.info("Ход диалога %s остановлен пользователем", chat_id)
     broadcaster.publish({"type": "stopped", "stage": "чат"})
     return {"ok": True, "stopped": True}
+
+
+@app.get("/api/domains")
+async def api_domains():
+    """Реестр сайтов для вкладки настроек «Сайты»: домен, уровень и за что он его заслужил.
+
+    Отдаём реестр, накопленный за прошлые прогоны, ВМЕСТЕ с доменами текущей сессии: человек
+    открывает настройки посреди работы и обязан увидеть то же, что видит в таблице выдачи.
+    Счётчики (страниц / с ценой / заблокированных) — чтобы уровень ставился по факту, а не на
+    глаз: домен с 40 страницами и нулём цен виден сразу.
+    """
+    from search_agent.config import load_settings
+    from search_agent.profile import LEVEL_NORMAL, LEVELS
+    from search_agent.storage import domains as reg
+    st = load_settings().storage
+    prof = profile.load_active(st)
+    levels = prof.ratings()
+    seen = reg.merged(session.items or [], cfg=st)
+    for dom in levels:                       # помеченный вручную домен обязан быть в списке,
+        seen.setdefault(dom, {"first_seen": "", "last_seen": "",
+                              "hits": 0, "priced": 0, "blocked": 0})   # даже если ещё не встречался
+    out = [{"domain": d, "level": levels.get(d, LEVEL_NORMAL), **v}
+           for d, v in sorted(seen.items())]
+    return {"ok": True, "domains": out, "levels": list(LEVELS),
+            "allowed_tlds": prof.allowed_tlds, "banned_tlds": prof.banned_tlds}
+
+
+class DomainLevelsRequest(BaseModel):
+    """Точечная правка реестра. Незаданные поля не трогаем — экран настроек шлёт только изменения."""
+    levels: dict[str, str] | None = None       # домен → preferred|normal|lowered|banned
+    allowed_tlds: list[str] | None = None
+    banned_tlds: list[str] | None = None
+
+
+@app.post("/api/domains")
+async def api_domains_save(req: DomainLevelsRequest):
+    """Сохранить уровни доменов и зоны в активный профиль (переживает перезапуск)."""
+    from search_agent.config import load_settings
+    from search_agent.profile import LEVEL_NORMAL, LEVELS, _norm_domain
+    st = load_settings().storage
+    prof = profile.load_active(st)
+    if req.levels is not None:
+        ratings = dict(prof.domain_ratings or {})
+        # Старые плоские списки — источник тех же сведений. Не свернув их сюда, пользователь
+        # снял бы уровень в реестре, а домен вернулся бы из унаследованного списка.
+        pref, blocked = prof.normalized_domains()
+        for d in pref:
+            ratings.setdefault(d, "preferred")
+        for d in blocked:
+            ratings.setdefault(d, "banned")
+        bad = []
+        for raw, level in req.levels.items():
+            dom = _norm_domain(raw)
+            if not dom:
+                continue
+            if level not in LEVELS:
+                bad.append("%s=%s" % (dom, level))
+                continue
+            if level == LEVEL_NORMAL:
+                ratings.pop(dom, None)         # «как все» — это отсутствие правила, а не правило
+            else:
+                ratings[dom] = level
+        if bad:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "Неизвестный уровень: %s" % ", ".join(bad)})
+        prof.domain_ratings = ratings
+        prof.preferred_domains, prof.blocked_domains = [], []   # всё переехало в domain_ratings
+    if req.allowed_tlds is not None:
+        prof.allowed_tlds = [z.strip().lstrip(".").lower() for z in req.allowed_tlds if str(z).strip()]
+    if req.banned_tlds is not None:
+        prof.banned_tlds = [z.strip().lstrip(".").lower() for z in req.banned_tlds if str(z).strip()]
+    if not profile.save(prof, cfg=st):
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "Не сохранено — хранилище недоступно (см. панель «Ход»)."})
+    log.info("Реестр сайтов сохранён: правил по доменам %d, зоны разрешены=%s, запрещены=%s",
+             len(prof.domain_ratings), ", ".join(prof.allowed_tlds) or "—",
+             ", ".join(prof.banned_tlds) or "—")
+    return {"ok": True, "levels": prof.ratings(),
+            "allowed_tlds": prof.allowed_tlds, "banned_tlds": prof.banned_tlds}
 
 
 @app.get("/api/sources/catalog")

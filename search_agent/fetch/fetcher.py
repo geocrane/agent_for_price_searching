@@ -19,6 +19,7 @@
 import asyncio
 import random
 import time
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 from . import antibot, cache, clean
@@ -65,6 +66,34 @@ class Fetcher:
         gap = random.uniform(*self.cfg.delay_range[:2]) - (time.monotonic() - last)
         if gap > 0:
             await asyncio.sleep(gap)
+
+    @asynccontextmanager
+    async def domain_slot(self, url: str):
+        """Право обратиться к домену: доменный лок плюс выдержанная пауза.
+
+        ВЫНЕСЕНО ИЗ `fetch_one` НАМЕРЕННО, и это не косметика. Вызывающий (agent/run.py::_h_fetch)
+        обязан брать этот слот СНАРУЖИ слота вкладки. Раньше лок и пауза (8–25 с) выполнялись
+        внутри `tab_gate.hold`, то есть вкладка была занята, пока корутина просто спала: две
+        страницы одного домена съедали оба слота при `concurrency: 2`, и остальные домены не
+        получали вкладку вообще. Ровно поэтому «четыре домена открывались по одному».
+        """
+        dom = urlparse(url).netloc.lower()
+        lock = self._domain_locks.setdefault(dom, asyncio.Lock())
+        async with lock:                                   # 1 запрос на домен за раз
+            await self._pace(dom)
+            yield dom
+
+    def forget_domain(self, domain: str) -> None:
+        """Забыть, когда мы последний раз были на домене: следующий заход пойдёт без паузы.
+
+        Нужно после ручного прохождения проверки: кука clearance живёт недолго, и заставлять
+        первую страницу ждать интервал — значит тратить её впустую.
+        """
+        want = (domain or "").lower().strip().removeprefix("www.")
+        if not want:
+            return
+        for key in [k for k in self._last_hit if k.split(":")[0].removeprefix("www.") == want]:
+            self._last_hit.pop(key, None)
 
     def _paths(self) -> list[str]:
         """Пути загрузки по возрастанию тяжести: лёгкий httpx, затем браузер (если разрешён)."""
@@ -129,7 +158,6 @@ class Fetcher:
         paths = self._paths()
         res = None
         for backend in paths:
-            await self._pace(dom)
             res = await self._attempt(url, backend)
             self._last_hit[dom] = time.monotonic()
             if backend == paths[-1] or not _needs_browser(res):
@@ -168,7 +196,8 @@ class Fetcher:
         if self.cfg.warmup and self._browser is not None:
             await self._browser.warmup(url)
 
-    async def fetch_one(self, url: str, use_cache: bool = True) -> dict:
+    async def fetch_one(self, url: str, use_cache: bool = True, *, slot_held: bool = False) -> dict:
+        """Загрузить страницу. `slot_held` — доменный слот уже взят вызывающим (см. domain_slot)."""
         if use_cache:
             hit = cache.get(url)
             # Из кэша отдаём ТОЛЬКО удачно взятую страницу. Отказ (блок/ошибка) — состояние
@@ -181,10 +210,11 @@ class Fetcher:
                 log_event(log, "fetch.cache_stale", url=url, blocked=hit.get("blocked"),
                           reason="в кэше отказ — гружу заново")
 
-        dom = urlparse(url).netloc.lower()
-        lock = self._domain_locks.setdefault(dom, asyncio.Lock())
-        async with lock:                                   # 1 запрос на домен за раз
-            res = await self._load(url, dom)
+        if slot_held:
+            res = await self._load(url, urlparse(url).netloc.lower())
+        else:
+            async with self.domain_slot(url) as dom:
+                res = await self._load(url, dom)
         if res.get("blocked") and not res.get("error"):
             log.warning("Заблокировано (%s): %s", res["blocked"], url)
         cache.put(url, res)

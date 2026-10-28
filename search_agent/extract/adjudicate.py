@@ -211,7 +211,10 @@ def adjudicate(item, prices: list[PriceCandidate], cfg=None) -> Verdict:
         return Verdict(primary=None, confidence=0.0)
 
     cfg = _cfg(cfg)
-    currency = _dominant_currency(prices)
+    # Валюта отчёта фиксирована настройкой (по умолчанию рубль): цену в долларах нельзя показать
+    # в той же колонке, что рублёвую, — конверсии у нас нет, а знака валюты в колонке тоже нет.
+    # Пустая настройка возвращает прежнее поведение — валюта большинства найденных цен.
+    currency = getattr(cfg, "base_currency", "") or _dominant_currency(prices)
     decisions: dict[int, dict] = {}          # id(цена) → решение (порядок = порядок находки)
     order: list[PriceCandidate] = list(prices)
 

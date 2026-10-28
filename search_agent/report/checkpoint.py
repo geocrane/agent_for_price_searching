@@ -24,7 +24,7 @@ import re
 import time
 from pathlib import Path
 
-from .xlsx import build_detail_rows, build_rows, build_site_rows, write_xlsx
+from .xlsx import build_detail_rows, build_rows, build_site_rows, build_summary_rows, write_xlsx
 from ..obs.log import get_logger
 
 log = get_logger("report.checkpoint")
@@ -117,9 +117,14 @@ def save(items: list[dict], directory: Path | str, *, headers: list[str] | None 
     done_rows = {it.get("row") for it in done}
 
     rows = build_rows(done)
+    # «Сводная» пишется и здесь: промежуточный отчёт обязан совпадать с финальным по составу
+    # листов, иначе пользователь, забравший файл на середине, получит другую структуру.
+    summary_columns, summary_rows = build_summary_rows(done, headers=headers,
+                                                       filename=directory.name)
     _atomic(directory / REPORT_NAME,
             lambda target: write_xlsx(rows, target, detail_rows=build_detail_rows(done),
-                                      site_rows=build_site_rows(done)))
+                                      site_rows=build_site_rows(done),
+                                      summary_columns=summary_columns, summary_rows=summary_rows))
     left = write_remainder(items, directory / REMAINDER_NAME, headers=headers, done_rows=done_rows)
 
     summary = {"dir": str(directory), "report": str(directory / REPORT_NAME),

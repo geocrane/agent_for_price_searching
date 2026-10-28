@@ -28,6 +28,8 @@
   • плоское событие `verdict` для UI (primary — число, excluded — счётчик) — путь webui.
 `norm_verdict` приводит обе к единому виду.
 """
+import re
+
 from ..obs.log import get_logger
 
 log = get_logger("report")
@@ -379,6 +381,124 @@ def build_site_rows(items: list[dict]) -> list[dict]:
     return out
 
 
+# Лист «Сводная»: исходная таблица заказчика, дополненная результатом поиска. Нужен, чтобы файл
+# можно было вернуть тому, кто его прислал: его собственные колонки на месте и в том же порядке,
+# а справа — что нашлось. Пары «Источник N / Цена N» — только сайты, где цена ДЕЙСТВИТЕЛЬНО есть.
+SUMMARY_RESULT_COLUMNS = ["Тип совпадения", "Статус позиции", "Найденное название",
+                          "Источник итоговой цены", "Найденная цена", "Комментарий модели",
+                          "Мин. цена", "Макс. цена", "Найдено цен, шт.", "Файл отчёта"]
+SUMMARY_MAX_SOURCES = 10          # потолок пар «Источник/Цена»: дальше таблица нечитаема
+
+
+def status_cell(nv: dict, not_found_reason: str | None, on_request: dict | None) -> str:
+    """Колонка «Статус позиции»: нашли цену, дают по запросу или не нашли — и почему."""
+    if nv.get("value") is not None:
+        return "цена найдена"
+    if on_request:
+        return "цена по запросу"
+    return "не найдено — %s" % (not_found_reason or "нет данных")
+
+
+def _priced_sites(item: dict) -> list[tuple[str, int]]:
+    """Сайты позиции с ценой: (домен, цена). Итоговый источник первым, остальные по возрастанию.
+
+    Цена на сайт одна — по тому же правилу, что показывал экран и лист «Сайты»
+    (`session.best_price`): точное совпадение, затем минимальная. Исключение — сайт, давший ИТОГ:
+    у него ставим именно итоговую цену. Иначе в одной строке рядом стоят «итог 799 ₽ по
+    stella-pro.ru» и «stella-pro.ru — 539 ₽», и это читается как ошибка отчёта.
+    """
+    from ..session import summarize_cand
+    nv = norm_verdict(item.get("verdict"))
+    primary_domain = (nv.get("domain") or "").lower()
+    primary_price = to_int(nv.get("value"))
+    sites: list[tuple[str, int]] = []
+    for c in item.get("candidates", []) or []:
+        if c.get("is_file"):
+            continue
+        dom = c.get("domain") or ""
+        price = to_int(summarize_cand(c)["price"])
+        if price is None:
+            continue
+        if primary_price is not None and dom.lower() == primary_domain:
+            price = primary_price
+        sites.append((dom, price))
+    sites.sort(key=lambda s: (0 if s[0].lower() == primary_domain else 1, s[1]))
+    return sites
+
+
+def build_summary_rows(items: list[dict], *, headers: list[str] | None = None,
+                       filename: str = "") -> tuple[list[str], list[dict]]:
+    """Колонки и строки листа «Сводная»: исходные колонки файла + результат поиска."""
+    from .checkpoint import _headers          # порядок колонок исходника (или по ключам raw)
+
+    src_cols = _headers(items, headers)
+    priced = {id(it): _priced_sites(it) for it in items}
+    n_sites = min(SUMMARY_MAX_SOURCES, max((len(v) for v in priced.values()), default=0))
+    pair_cols: list[str] = []
+    for i in range(1, n_sites + 1):
+        pair_cols += ["Источник %d" % i, "Цена %d" % i]
+    columns = src_cols + SUMMARY_RESULT_COLUMNS + pair_cols
+
+    rows: list[dict] = []
+    for it in items:
+        nv = norm_verdict(it.get("verdict"))
+        onreq = it.get("on_request")
+        price = to_int(nv["value"])
+        raw = it.get("raw") or {}
+        # Позиция без сохранённых исходных ячеек (сессия прежней версии) не должна потерять
+        # наименование: без него строку не сопоставить с исходным файлом.
+        if not raw and src_cols:
+            raw = {src_cols[0]: it.get("name")}
+        row = {c: raw.get(c) for c in src_cols}
+        row.update({
+            "Тип совпадения": match_cell(nv, it.get("not_found_reason"), onreq),
+            "Статус позиции": status_cell(nv, it.get("not_found_reason"), onreq),
+            "Найденное название": (nv["found"] or (onreq or {}).get("found") or "").strip(),
+            "Источник итоговой цены": nv["domain"] or (onreq or {}).get("domain") or "",
+            "Найденная цена": price,
+            "Комментарий модели": (it.get("rationale") or "").strip(),
+            "Мин. цена": to_int(nv["price_min"]),
+            "Макс. цена": to_int(nv["price_max"]),
+            "Найдено цен, шт.": len(priced[id(it)]),
+            "Файл отчёта": filename or "",
+            # Признак «цена надёжна» — тот же, что на «Итогах» (им красится ячейка цены): цена
+            # есть И не помечена «требует проверки» И подтверждена моделью. Разные правила на
+            # двух листах означали бы, что одна и та же строка подсвечена в одном месте и нет
+            # в другом — читатель решил бы, что отчёт сам себе противоречит.
+            "_found": ((price is not None or bool(onreq))
+                       and not nv.get("needs_review") and nv.get("verified", True)),
+        })
+        for i, (dom, val) in enumerate(priced[id(it)][:n_sites], start=1):
+            row["Источник %d" % i] = dom
+            row["Цена %d" % i] = val
+        rows.append(row)
+    return columns, rows
+
+
+_PAIR_COL = re.compile(r"^(Источник|Цена) \d+$")     # только наши пары: «Цена общая» — не отсюда
+
+
+def _summary_layout(columns: list[str]) -> dict:
+    """Ширины и роли колонок листа «Сводная» (индексы 1-based, как их ждёт `_write_sheet`).
+
+    Число исходных колонок считаем вычитанием: имена у них любые (это колонки заказчика), а вот
+    свои мы знаем точно. Шаблон пар строгий — иначе «Цена общая» из прайса заказчика сойдёт за
+    нашу колонку и вся раскладка сместится.
+    """
+    n_pairs = sum(1 for c in columns if _PAIR_COL.match(str(c)))
+    n_src = len(columns) - len(SUMMARY_RESULT_COLUMNS) - n_pairs
+    widths = [28] * n_src + [30, 20, 34, 22, 13, 60, 12, 12, 13, 26] + [22, 11] * (n_pairs // 2)
+    price_i = n_src + SUMMARY_RESULT_COLUMNS.index("Найденная цена") + 1
+    price_cols = [price_i,
+                  n_src + SUMMARY_RESULT_COLUMNS.index("Мин. цена") + 1,
+                  n_src + SUMMARY_RESULT_COLUMNS.index("Макс. цена") + 1]
+    price_cols += [i + 1 for i, c in enumerate(columns) if str(c).startswith("Цена ")
+                   and _PAIR_COL.match(str(c))]
+    wrap = (n_src + 1, n_src + 3, n_src + 6)             # тип, найденное название, комментарий
+    return {"widths": widths, "wrap_cols": wrap, "price_cols": tuple(price_cols),
+            "link_col": None, "price_col": price_i}
+
+
 def _write_sheet(ws, columns: list[str], rows: list[dict], *, widths: list[int],
                  wrap_cols: tuple, price_cols: tuple, link_col: int | None,
                  price_col: int | None) -> None:
@@ -432,7 +552,9 @@ def _write_sheet(ws, columns: list[str], rows: list[dict], *, widths: list[int],
 
 def write_xlsx(rows: list[dict], path: str, *, sheet_title: str = "Итоги",
                detail_rows: list[dict] | None = None, detail_title: str = "Детали",
-               site_rows: list[dict] | None = None, site_title: str = "Сайты") -> str:
+               site_rows: list[dict] | None = None, site_title: str = "Сайты",
+               summary_columns: list[str] | None = None, summary_rows: list[dict] | None = None,
+               summary_title: str = "Сводная") -> str:
     """Записать отчёт в .xlsx: итоги по позициям + все цены с разбором отбора + снимок по сайтам.
 
     Возвращает путь к файлу. Требует openpyxl (уже в зависимостях, см. input.excel_reader).
@@ -460,6 +582,13 @@ def write_xlsx(rows: list[dict], path: str, *, sheet_title: str = "Итоги",
                      widths=_SITE_WIDTHS, wrap_cols=_SITE_WRAP_COLS,
                      price_cols=_SITE_PRICE_COLS, link_col=_SITE_LINK_COL, price_col=None)
         ws3.auto_filter.ref = ws3.dimensions
+
+    # «Сводная» — последним листом: это исходная таблица заказчика с приписанным результатом,
+    # её колонки зависят от загруженного файла, поэтому приходят готовыми снаружи.
+    if summary_rows is not None and summary_columns:
+        ws4 = wb.create_sheet(summary_title)
+        _write_sheet(ws4, summary_columns, summary_rows, **_summary_layout(summary_columns))
+        ws4.auto_filter.ref = ws4.dimensions
 
     wb.save(path)
     found = sum(1 for r in rows if r["_found"])

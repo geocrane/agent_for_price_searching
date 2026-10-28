@@ -114,7 +114,13 @@ body {
 .map-summary .warn { color: var(--warn); }
 
 /* ---- Рабочая зона -------------------------------------------------------- */
-.workspace { display: grid; grid-template-columns: 1fr 420px; min-height: 0; }
+/* Правая колонка СЖИМАЕМАЯ (clamp), а не жёсткие 420px: на узком окне фиксированная колонка
+   вместе с содержимым таблицы не влезала в ширину экрана, и панель уезжала за край.
+   minmax(0, 1fr) слева — по той же причине, что и у body: минимум грид-колонки по умолчанию
+   равен min-content её содержимого. overflow: hidden — последний рубеж: что не влезло, обязано
+   прокручиваться внутри своей панели, а не выпирать наружу. */
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr) clamp(300px, 30vw, 420px);
+  min-height: 0; min-width: 0; overflow: hidden; }
 /* Три ряда по числу детей: тулбар / таблица / run-бар. Растягивается ТАБЛИЦА — иначе всё
    свободное место забирал пустой тулбар и таблица уезжала к низу экрана. */
 /* min-width: 0 — обязательно. По умолчанию минимальная ширина грид-элемента равна ширине его
@@ -222,15 +228,25 @@ body {
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
 
 /* ---- Правая панель ------------------------------------------------------- */
-.side { display: grid; grid-template-rows: auto 1fr; min-height: 0; min-width: 0; background: var(--panel); }
-.tabs { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.side { display: grid; grid-template-rows: auto 1fr; min-height: 0; min-width: 0;
+  overflow: hidden; background: var(--panel); }
+/* flex-wrap обязателен: четыре кнопки вкладок ПЛЮС инструменты вкладки (select + поле поиска)
+   в 420px не помещаются, а flex по умолчанию не переносит и не сжимает элементы ниже их
+   min-content — строка распирала панель, и правый край уходил за границу окна. */
+.tabs { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; padding: 6px 8px;
+  min-width: 0; border-bottom: 1px solid var(--border); }
 .tab { padding: 6px 12px; border: none; background: none; color: var(--muted); cursor: pointer;
   border-radius: 8px; font-size: 13px; }
 .tab.active { background: var(--panel-2); color: var(--text); font-weight: 600; }
-.tab-tools { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/* Инструменты занимают остаток строки и СЖИМАЮТСЯ: у input[type=search] своя ширина ~170px,
+   и без min-width: 0 он не даёт flex-элементу стать уже — поле вылезало за край панели. */
+.tab-tools { display: flex; align-items: center; gap: 6px; margin-left: auto;
+  flex: 1 1 180px; min-width: 0; }
 .tab-tools select, .tab-tools input { border: 1px solid var(--border); border-radius: 7px;
-  background: var(--panel-2); color: var(--text); font-size: 12px; padding: 3px 6px; }
-.tab-panel { min-height: 0; display: grid; grid-template-rows: 1fr auto; }
+  background: var(--panel-2); color: var(--text); font-size: 12px; padding: 3px 6px;
+  min-width: 0; }
+.tab-tools input[type="search"] { flex: 1 1 auto; width: 100%; }
+.tab-panel { min-height: 0; min-width: 0; display: grid; grid-template-rows: 1fr auto; }
 
 /* Диалог */
 .messages { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
@@ -275,8 +291,11 @@ body {
   padding: 8px 10px; background: var(--panel-2); color: var(--text); font: inherit; }
 
 /* Ход (логи) */
+/* overflow-wrap: anywhere — длинная строка лога/ответа модели не имеет права распирать панель:
+   в моноширинном шрифте одна ссылка или JSON-строка легко шире 420px. */
 .log-console { grid-row: 1 / span 2; overflow: auto; padding: 8px 10px; font-family: ui-monospace, Menlo, monospace;
-  font-size: 12px; line-height: 1.5; background: var(--panel); }
+  font-size: 12px; line-height: 1.5; background: var(--panel); min-width: 0;
+  overflow-wrap: anywhere; }
 
 /* ---- Вкладка «Модель»: ответы модели отдельно от консольных логов ---------- */
 /* Каждая запись подписана номером позиции и наименованием: «что модель сказала про этот товар»
@@ -343,6 +362,8 @@ body {
 /* Отвечает на вопрос «что работает и с какой скоростью» — реальными запросами, а не по
    настройкам. Три строки-результата плюс действующие лимиты, из которых складывается скорость. */
 .modal.wide { width: min(680px, 94vw); }
+/* Реестр сайтов — многоколоночный список на сотни доменов: 680px для него мало. */
+.modal.xwide { width: min(1100px, 96vw); }
 .check-list { display: flex; flex-direction: column; gap: 10px; }
 .check { display: grid; grid-template-columns: 24px 1fr; gap: 8px; align-items: start;
   padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); }
@@ -439,6 +460,24 @@ body {
 /* Ждёт слот этапа (лимит позиций). Не «готово» и не «выполняется» — отдельное состояние. */
 .qitem.st-blocked { border-style: dashed; }
 .qitem.st-blocked .qs { color: var(--warn); }
+
+/* Блокировки: страницы, закрытые капчей, сгруппированные по домену.
+   Ряды сетки переопределяем по той же причине, что у очереди: сообщение сверху, список скроллится. */
+#panel-blocked { overflow: hidden; padding: 0; grid-template-rows: auto minmax(0, 1fr); }
+.blk-empty { color: var(--muted); font-size: 13px; padding: 16px 10px; text-align: center; }
+.blk-empty[hidden] { display: none; }
+.blk-list { overflow: auto; padding: 8px 10px; min-height: 0; display: flex;
+  flex-direction: column; gap: 8px; }
+.blk-group { border: 1px solid var(--border); border-radius: 9px; background: var(--panel-2);
+  padding: 6px 8px; }
+.blk-head { display: flex; align-items: center; gap: 8px; }
+.blk-dom { flex: 1; font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.blk-count { font-size: 11px; color: var(--muted); }
+.blk-why { font-size: 11px; color: var(--warn); }
+.blk-item { display: flex; gap: 6px; padding: 3px 2px 0; font-size: 12.5px; }
+.blk-page { color: var(--accent); cursor: pointer; white-space: nowrap; }
+.blk-name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Загрузка этапов: сколько позиций внутри каждого этапа из лимита (событие stage_load) */
 .stage-load { padding: 6px 12px; border-bottom: 1px solid var(--border); background: var(--panel);
@@ -547,3 +586,58 @@ body {
 .pos-table .c-range .prange { color: var(--muted); }
 .pos-table .c-range .pconf { color: var(--muted); font-size: 11px; margin-left: 5px; }
 .pos-table .c-name { word-break: break-word; }
+
+/* ==== v=15: блокировки (фильтр/группировка) и реестр сайтов ================ */
+
+/* Инструменты вкладки «Блокировки»: поиск + «только без цены» + группировка.
+   Переносятся на свою строку, чтобы не воевать с кнопками вкладок за ширину панели. */
+.blk-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
+  flex: 1 1 100%; min-width: 0; }
+.blk-tools .chk-inline { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+  color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap; }
+.blk-tools .chk-inline input { margin: 0; }
+.seg-mini { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.seg-mini button { border: none; background: none; color: var(--muted); cursor: pointer;
+  font-size: 11.5px; padding: 3px 8px; }
+.seg-mini button.active { background: var(--panel-2); color: var(--text); font-weight: 600; }
+
+/* Повторная блокировка: домен уже открывали руками, и он закрылся снова. Предлагать по нему
+   то же действие, что и по первичной блокировке, было бы неправдой — помечаем явно. */
+.blk-again { font-size: 10px; font-weight: 600; color: var(--err); white-space: nowrap;
+  border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border)); border-radius: 999px;
+  padding: 0 6px; }
+.blk-group.again { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+.blk-item .blk-again { margin-left: auto; }
+/* Что сейчас с ручным окном ЭТОЙ страницы. Раньше «идёт проверка» показывалось только общей
+   строкой статуса внизу, которую перетирало любое следующее событие: понять, какая именно
+   страница ждёт человека, было нельзя. Теперь состояние стоит там же, где сама страница. */
+.blk-manual { margin-left: auto; font-size: 10px; white-space: nowrap; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; }
+.blk-manual.wait { color: var(--warn); font-weight: 600;
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.blk-item .blk-again + .blk-manual { margin-left: 6px; }
+/* Заголовок группы по товару: номер строки и наименование в одну строку с многоточием. */
+.blk-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Настройки → «Сайты»: реестр доменов ---------------------------------- */
+.sites-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-bottom: 10px; }
+.sites-bar input[type="search"] { flex: 1 1 200px; min-width: 0; }
+.sites-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+/* Многоколоночный список с прокруткой: доменов сотни, в одну колонку это бесконечная лента. */
+.sites-list { max-height: 46vh; overflow: auto; border: 1px solid var(--border); border-radius: 10px;
+  padding: 6px 8px; background: var(--panel-2);
+  column-width: 320px; column-gap: 18px; }
+.sites-letter { break-inside: avoid; margin: 8px 0 3px; font-size: 11px; font-weight: 700;
+  color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+  border-bottom: 1px solid var(--border); }
+.sites-row { break-inside: avoid; display: flex; align-items: center; gap: 6px; padding: 2px 0;
+  font-size: 12.5px; }
+.sites-dom { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sites-stat { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+.sites-row select { border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
+  color: var(--text); font-size: 11.5px; padding: 1px 4px; }
+/* Уровень виден цветом, не только текстом в поле: список длинный, глазами по нему ходят быстро. */
+.sites-row.lv-preferred .sites-dom { color: var(--ok); font-weight: 600; }
+.sites-row.lv-lowered .sites-dom { color: var(--warn); }
+.sites-row.lv-banned .sites-dom { color: var(--err); text-decoration: line-through; }
+.sites-empty { color: var(--muted); font-size: 12.5px; padding: 12px 4px; text-align: center; }

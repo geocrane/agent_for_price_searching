@@ -62,7 +62,7 @@ class OrchestratedRun:
     GATED_STAGES = ("discover", "fetch", "inspect", "find_link", "escalate", "extract")
 
     def __init__(self, items, *, settings, fetcher, llm_client=None, model=None, emit=None,
-                 model_lanes: int = 1, budgets: dict | None = None,
+                 budgets: dict | None = None,
                  fetch_concurrency: int | None = None, affix: str | None = None,
                  use_llm_queries: bool = False, journal=None, max_pages: int = 1,
                  stage_positions: int | None = None, enough_confirmations: int = 0) -> None:
@@ -87,6 +87,11 @@ class OrchestratedRun:
         # очереди. Порог осознанно низкий: полезные источники ниже 0,2 в замерах не встречались.
         self.relevance_gate = bool(getattr(settings.discovery, "relevance_gate", True))
         self.relevance_low = float(getattr(settings.discovery, "relevance_low", 0.2))
+        # Вес «обычного» домена. Кандидат с весом НИЖЕ него — это домен, который пользователь
+        # пометил пониженным в настройках сайтов; по умолчанию (top_n=0) выдача не сортируется,
+        # поэтому «пониженный» обязан проявляться именно порядком в очереди, иначе пометка
+        # не делала бы ничего видимого.
+        self._default_weight = float((settings.sources or {}).get("default_weight", 0.3))
         self._disc = None                            # ресурсы обнаружения (backend/client/семафор) — на время run()
         self.by_row = {it["row"]: it for it in items}
 
@@ -106,7 +111,7 @@ class OrchestratedRun:
         # Отсчёт от создания прогона — то есть от нажатия «Найти», а не от первого запроса.
         self.timer = RunTimer(started=self.journal.started)
 
-        self.orch = Orchestrator(emit=self.emit, model_lanes=model_lanes)
+        self.orch = Orchestrator(emit=self.emit)
 
         # Ровно N живых вкладок: единый лимит на всю загрузку (fetch всех товаров идёт
         # параллельно под ним → предсказуемое число одновременных доменов). human_input ⇒ 1.
@@ -143,6 +148,24 @@ class OrchestratedRun:
         self.enough_confirmations = max(0, int(enough_confirmations or 0))
         self._satisfied: set[int] = set()           # позиции, по которым цены уже достаточно
 
+        # Домены, которые человек открыл вручную в этом прогоне. Нужны для двух решений сразу:
+        # отличить ПОВТОРНУЮ блокировку от первой (повторную имеет смысл открывать только руками,
+        # и в «Блокировках» она помечена отдельно) и решить, поднимать ли остальные страницы
+        # домена — при повторной блокировке они остаются человеку (см. `manual_domain_opened`).
+        self._manual_opened: set[str] = set()
+        # Страницы, задача загрузки которых уже поставлена: (строка, url). Без этого повторный
+        # клик по домену ставил те же страницы второй раз, и каждая копия платила свою паузу
+        # 8–25 с. Ключ снимается, когда задача отработала (`_h_fetch`), а не когда началась.
+        self._inflight: set[tuple[int, str]] = set()
+        # Прогон сворачивается: хвост идёт, новую работу принимать нельзя (см. `_finish`).
+        self.closing = False
+        # Взводится на каждой поставленной задаче. Его ждёт `run_open`: прогон-продолжение обязан
+        # пережить пустую очередь, иначе каждый клик по домену поднимал бы новый браузер.
+        self._new_work = asyncio.Event()
+
+        # Переспрос модели по страницам из кэша делается РОВНО ОДИН РАЗ за прогон: если модель
+        # не поднялась и на нём, второй заход дал бы ту же деградацию за те же деньги.
+        self._remodelled = False
         self._pending: dict[int, int] = {}          # сколько задач по позиции ещё в работе
         self._adjudicated: set = set()
         self._esc_used: dict[int, int] = {}
@@ -167,7 +190,12 @@ class OrchestratedRun:
                                 "domain": cand.get("domain", ""), "status": status,
                                 "chars": s["chars"], "found": s["found"], "match": s["match"],
                                 "price": s["price"], "comment": s["comment"],
-                                "note": s["note"]})
+                                # Товар на странице есть, а цифры цены нет. Без этого поля
+                                # колонка «Цена» у такого источника показывала прочерк, хотя
+                                # статус рядом говорил «цена по запросу»: два разных ответа на
+                                # один вопрос в одной строке.
+                                "on_request": s["on_request"],
+                                "note": s["note"], "reblocked": s["reblocked"]})
 
     async def _fetch_load(self) -> None:
         """Видимая асинхронность: сколько вкладок сейчас открыто из скольких доступно."""
@@ -267,6 +295,8 @@ class OrchestratedRun:
         if row in self._satisfied:               # цены по позиции уже достаточно — новых не ставим
             await self._skip_rest(row, cand)
             return
+        if (row, cand.get("url")) in self._inflight:
+            return                               # уже в очереди — вторая копия только тратит паузу
         title, snippet = cand.get("title") or "", cand.get("snippet") or ""
         # Судить не по чему (карточка, найденная по ссылке с листинга; кандидат из фикстуры) —
         # значит, доказательств против нет. Отсутствие данных не равно нерелевантности.
@@ -280,6 +310,9 @@ class OrchestratedRun:
                      cand.get("domain", ""), (cand.get("title") or "")[:60])
             return
         low = self.relevance_gate and judgeable and rel < self.relevance_low
+        w = cand.get("weight")
+        if w is not None and float(w) < self._default_weight:
+            low = True                           # домен помечен пониженным — смотрим последним
         self._submit("fetch", row, {"cand": cand},
                      priority=Priority.LOW if low else Priority.NORMAL)
 
@@ -349,12 +382,119 @@ class OrchestratedRun:
                          note="не понадобился: цена уже подтверждена (%d источников)"
                               % len(self._priced_domains(row)))
 
+    # ---- ручное открытие домена ----------------------------------------------
+
+    def manual_domain_opened(self, domain: str) -> bool:
+        """Отметить домен открытым вручную. True — его уже открывали раньше (повторная блокировка).
+
+        Решение «поднимать ли остальные страницы домена» принимается ровно здесь и только здесь.
+        Признак существовал и раньше, но на это решение не влиял: остальные страницы поднимались
+        ВСЕГДА, в том числе после повторной блокировки — то есть человека отправляли ждать ту же
+        автозагрузку, которая только что не прошла.
+        """
+        dom = (domain or "").lower().strip()
+        if not dom:
+            return False
+        again = dom in self._manual_opened
+        self._manual_opened.add(dom)
+        return again
+
+    async def unblock_domain(self, domain: str) -> int:
+        """Домен открыли вручную — вернуть его страницы в работу ВПЕРЁД очереди. Вернёт их число.
+
+        Человек прошёл проверку в окне инструмента, и кука проверки лежит в общем постоянном
+        профиле браузера (fetch/browser.py) — значит у автоматической загрузки того же домена
+        появился шанс. Ждать своей очереди по номеру строки эти страницы не должны: кука живёт
+        недолго, поэтому задачи идут с Priority.HIGH (см. gates.RowGate.acquire).
+
+        Статус СРАЗУ становится «в очереди», а не остаётся «блокировкой» до старта задачи. Между
+        постановкой и стартом проходят минуты (пауза по домену), и всё это время страница висела
+        в «Блокировках» — человек кликал по тому, что уже в работе.
+        """
+        dom = (domain or "").lower().strip()
+        if not dom:
+            return 0
+        self._blocked_domains.discard(dom)
+        # Кука проверки свежая ровно сейчас — заставлять первую страницу выдерживать интервал
+        # значит тратить её впустую.
+        self.fetcher.forget_domain(dom)
+        queued = 0
+        for it in self.items:
+            row = it["row"]
+            for cand in it.get("candidates", []) or []:
+                if cand.get("is_file") or (cand.get("domain") or "").lower() != dom:
+                    continue
+                if cand.get("status") not in sess.UNBLOCKABLE:
+                    continue
+                if (row, cand.get("url")) in self._inflight:
+                    continue                      # уже поставлена — второй раз не платим паузу
+                # Свод по позиции мог быть уже посчитан — без сброса он не пересчитается и цена
+                # с открытой страницы никуда не попадёт (тот же приём, что при доборе выдачи).
+                self._adjudicated.discard(row)
+                cand.pop("reblocked", None)
+                await self._site(row, cand, sess.STATUS_QUEUED,
+                                 note="домен открыт вручную — в очереди на загрузку")
+                self._submit("fetch", row, {"cand": cand}, priority=Priority.HIGH)
+                queued += 1
+        if queued:
+            log.info("Домен %s открыт вручную — вернул в работу страниц: %d", dom, queued)
+        else:
+            log.info("Домен %s открыт вручную, но ждущих страниц у него нет", dom)
+        return queued
+
+    async def submit_grabbed_page(self, url: str, page_url: str | None = None) -> int:
+        """Страницу забрали в ручном окне — поставить её СРАЗУ на извлечение, минуя загрузку.
+
+        Сеть ей не нужна: страница уже лежит в дисковом кэше (`fetch/manual.py` кладёт её под
+        ФАКТИЧЕСКИМ адресом окна — человек мог прийти на карточку через редирект). Гнать её
+        через `fetch` было бы не просто лишней работой: повторный сетевой заход на домен с
+        антиботом с большой вероятностью снова упрётся в проверку и обнулит ручную работу.
+
+        Сайт при этом сразу уходит из «Блокировок»: человек его открыл и прочитал — держать его
+        в списке «ждут человека» было бы неправдой. Возвращает число поставленных задач (один и
+        тот же URL встречается у нескольких позиций).
+        """
+        from ..fetch import cache
+        # `page_url` — фактический адрес окна: ручной забор кладёт запись под ним (человек мог
+        # прийти на карточку через редирект), а кандидат хранит исходный URL из выдачи.
+        rec, err = cache.get_any(page_url, url)
+        if rec is None:
+            log.warning("Ручная страница не поставлена в очередь (%s): %s", url, err)
+            return 0
+        queued = 0
+        for it in self.items:
+            row = it["row"]
+            for cand in it.get("candidates", []) or []:
+                if cand.get("is_file"):
+                    continue
+                if not (sess.same_url(cand.get("url"), url)
+                        or sess.same_url(cand.get("fetch_key"), url)):
+                    continue
+                # Страницу передаём прямо в кандидата: извлечение возьмёт её отсюда
+                # (`extract._fetch_of`) и не пойдёт в кэш второй раз по неверному ключу.
+                cand["fetch"] = rec
+                cand["fetch_key"] = rec.get("url") or page_url or url
+                cand["chars"] = rec.get("chars")
+                cand["manual"] = True              # источник открыт человеком — видно в отчёте
+                cand.pop("reblocked", None)
+                cand.pop("extract_failed", None)
+                cand.pop("extract_reason", None)
+                self._adjudicated.discard(row)     # свод пересчитается уже с этой ценой
+                await self._site(row, cand, sess.STATUS_FETCHED,
+                                 note="открыто вручную — в очереди на извлечение")
+                self._submit("extract", row, {"cand": cand}, priority=Priority.HIGH)
+                queued += 1
+        log.info("Ручная страница поставлена на извлечение (%s): позиций %d", url, queued)
+        return queued
+
     # ---- постановка задач и учёт по позиции ----------------------------------
 
-    def _submit(self, kind, row, payload, uses_model=False, priority=Priority.NORMAL):
+    def _submit(self, kind, row, payload, priority=Priority.NORMAL):
+        if kind == "fetch":                        # учёт «эта страница уже в очереди» — здесь
+            self._inflight.add((row, (payload.get("cand") or {}).get("url")))
         self._pending[row] = self._pending.get(row, 0) + 1
-        self.orch.submit(AgentTask(kind=kind, row=row, payload=payload,
-                                   uses_model=uses_model, priority=priority))
+        self._new_work.set()                       # разбудить run_open, если он ждёт работы
+        self.orch.submit(AgentTask(kind=kind, row=row, payload=payload, priority=priority))
 
     async def _after(self, row) -> None:
         """Задача по позиции завершилась. Когда их не осталось — считаем свод (adjudicate)."""
@@ -424,29 +564,48 @@ class OrchestratedRun:
                 await self._skip_rest(row, cand)
                 return
             async with self._stage(task, "fetch"):
+                # Страницу уже забрал человек, пока задача стояла в очереди. Идти за ней в сеть
+                # значит с большой вероятностью снова упереться в проверку и обнулить его работу.
+                if cand.get("manual"):
+                    log.info("Загрузка не нужна: страница взята вручную — %s", cand.get("url", ""))
+                    return
                 # Домен уже показал антибот в этом прогоне — остальные его страницы не трогаем.
                 # Ограничение действует ТОЛЬКО на заблокированные: домен, который открывается,
                 # грузится целиком, сколько бы у него ни было карточек.
                 dom = (cand.get("domain") or "").lower()
                 if dom and dom in self._blocked_domains:
-                    await self._site(row, cand, sess.STATUS_BLOCKED,
-                                     note="пропущено: домен уже дал блок в этом прогоне")
-                    log.info("Пропуск %s — домен %s уже заблокирован в этом прогоне",
-                             cand.get("url", ""), dom)
+                    # Домен уже открывали руками, и он закрылся СНОВА — обычное «откройте вручную»
+                    # тут было бы враньём: человек это уже сделал. Помечаем повторной блокировкой.
+                    again = dom in self._manual_opened
+                    cand["reblocked"] = again
+                    await self._site(row, cand, sess.STATUS_MANUAL_WAIT,
+                                     note="повторная блокировка домена — открывается только вручную"
+                                     if again else
+                                     "домен под антиботом — откройте его вручную "
+                                     "(вкладка «Блокировки»)")
+                    log.info("Страница ждёт ручного открытия (%s): домен %s под антиботом%s",
+                             cand.get("url", ""), dom, " (повторно)" if again else "")
                     return
                 await self._site(row, cand, sess.STATUS_FETCHING, note="загрузка страницы")
                 await _emit(self.emit, {"type": "position", "row": row, "stage": "fetch", "state": "active"})
-                async with self.tab_gate.hold(row):   # ровно N вкладок одновременно (предсказуемо)
-                    # Ожидание вкладки — самое долгое место очереди, и порог мог быть достигнут
-                    # именно за это время. Проверяем ещё раз, уже со слотом на руках: иначе
-                    # страница грузится, хотя цена по позиции давно подтверждена.
-                    if row in self._satisfied:
-                        await self._skip_rest(row, cand)
-                        return
-                    await self._fetch_load()          # «открыто вкладок N/M» — видно в UI
-                    res = await self.fetcher.fetch_one(cand["url"])
+                # ПОРЯДОК ЗАХВАТА ВАЖЕН: доменный слот (лок + пауза 8–25 с) берётся СНАРУЖИ
+                # слота вкладки. Раньше он был внутри, и вкладка оставалась занятой всё время
+                # сна — два слота съедались одним доменом, а остальные домены не грузились
+                # вообще. Инвариант вложенности (gates.py) соблюдён: гейт этапа всё так же
+                # самый внешний, а доменный лок ничьих гейтов не ждёт.
+                async with self.fetcher.domain_slot(cand["url"]):
+                    async with self.tab_gate.hold(row):   # ровно N вкладок одновременно
+                        # Ожидание вкладки — самое долгое место очереди, и порог мог быть
+                        # достигнут именно за это время. Проверяем ещё раз, уже со слотом на
+                        # руках: иначе страница грузится, хотя цена давно подтверждена.
+                        if row in self._satisfied:
+                            await self._skip_rest(row, cand)
+                            return
+                        await self._fetch_load()      # «открыто вкладок N/M» — видно в UI
+                        res = await self.fetcher.fetch_one(cand["url"], slot_held=True)
                 await self._fetch_load()
                 cand["fetch"] = res
+                cand["fetch_key"] = res.get("url") or cand["url"]   # где страница легла в кэш
                 cand["chars"] = res.get("chars")
                 await _emit(self.emit, {"type": "fetched", "row": row, "url": cand["url"],
                                         "status": res.get("status"), "blocked": res.get("blocked"),
@@ -456,7 +615,11 @@ class OrchestratedRun:
                     # загрузки (таймаут, сеть) домен НЕ блокирует — это разовый сбой, а не антибот.
                     if dom:
                         self._blocked_domains.add(dom)
-                    await self._site(row, cand, sess.STATUS_BLOCKED, note="блок: %s" % res.get("blocked"))
+                    again = bool(dom) and dom in self._manual_opened
+                    cand["reblocked"] = again
+                    note = ("повторная блокировка после ручного открытия: %s" if again
+                            else "блок: %s") % res.get("blocked")
+                    await self._site(row, cand, sess.STATUS_BLOCKED, note=note)
                 elif res.get("error"):
                     await self._site(row, cand, sess.STATUS_ERROR, note="ошибка загрузки")
                 else:
@@ -465,6 +628,7 @@ class OrchestratedRun:
                                      note="страница загружена%s" % via)
                 self._submit("inspect", row, {"cand": cand})
         finally:
+            self._inflight.discard((row, cand.get("url")))
             await self._after(row)
 
     async def _h_inspect(self, task, orch):
@@ -477,8 +641,14 @@ class OrchestratedRun:
                                         "domain": cand.get("domain", ""), "kind": insp["kind"],
                                         "price_present": insp["price_present"], "reason": insp["reason"]})
                 if insp["kind"] in ("blocked", "empty", "shell"):
+                    # Инспекция идёт ПОСЛЕ загрузки и переписывает подпись под статусом. Признак
+                    # повторной блокировки при этом терялся, и страница домена, который человек
+                    # уже открывал руками, выглядела как обычная первичная блокировка.
+                    reason = str(insp.get("reason"))
+                    if cand.get("reblocked"):
+                        reason = "повторная блокировка после ручного открытия: %s" % reason
                     await self._site(row, cand, sess.STATUS_EMPTY if insp["kind"] == "shell"
-                                     else sess.STATUS_BLOCKED, note=str(insp.get("reason")))
+                                     else sess.STATUS_BLOCKED, note=reason)
                 plan = plan_after_inspect(
                     insp, can_escalate=self._has(self._esc_used, row, self.escalate_budget),
                     can_find_link=self._has(self._find_used, row, self.find_link_budget))
@@ -490,7 +660,7 @@ class OrchestratedRun:
                         self._use(self._find_used, row)
                         self._submit("find_link", row, {"cand": cand})
                     elif step == "extract":
-                        self._submit("extract", row, {"cand": cand}, uses_model=False)  # модель — через AdaptiveExecutor
+                        self._submit("extract", row, {"cand": cand})
         finally:
             await self._after(row)
 
@@ -512,7 +682,7 @@ class OrchestratedRun:
                     it.setdefault("candidates", []).append(card)   # чтобы свод увидел её цены
                     self._submit("fetch", row, {"cand": card})
                 else:                                              # карточки нет — пробуем листинг
-                    self._submit("extract", row, {"cand": cand}, uses_model=False)  # модель — через AdaptiveExecutor
+                    self._submit("extract", row, {"cand": cand})
         finally:
             await self._after(row)
 
@@ -531,7 +701,8 @@ class OrchestratedRun:
                                             "via": "marketplace_json", "kind": insp["kind"]})
                     if insp["kind"] not in ("blocked", "empty"):
                         cand["fetch"], cand["url_effective"] = res, ep
-                        self._submit("extract", row, {"cand": cand}, uses_model=False)  # модель — через AdaptiveExecutor
+                        cand["fetch_key"] = res.get("url") or ep
+                        self._submit("extract", row, {"cand": cand})
                 # иначе кандидат остаётся заблокированным → учтётся в причине при своде
         finally:
             await self._after(row)
@@ -539,10 +710,21 @@ class OrchestratedRun:
     async def _h_extract(self, task, orch):
         row, cand = task.row, task.payload["cand"]
         try:
-            if row in self._satisfied:            # цены по позиции уже достаточно (см. _h_fetch)
+            # Порог «достаточно источников» экономит АВТОМАТИЧЕСКУЮ работу. Страницу, которую
+            # человек открыл руками и прошёл на ней проверку, он не экономит: выбросить её со
+            # словами «не понадобился» — значит молча стереть уже потраченное человеком время.
+            refill = bool(task.payload.get("refill"))
+            if row in self._satisfied and not cand.get("manual") and not refill:
                 await self._skip_rest(row, cand)
                 return
             async with self._stage(task, "extract"):
+                if refill:
+                    # Следы прошлой деградации снимаем ДО вызова: иначе «модель недоступна»
+                    # осталось бы причиной у страницы, которую модель только что прочитала, а
+                    # старая цена «по запросу» пережила бы новый ответ.
+                    for key in ("degraded", "extract_failed", "extract_reason", "on_request",
+                                "comment", "result_note"):
+                        cand.pop(key, None)
                 await self._site(row, cand, sess.STATUS_EXTRACTING, note="извлечение цены")
                 await _emit(self.emit, {"type": "position", "row": row, "stage": "fetch", "state": "done"})
                 await _emit(self.emit, {"type": "position", "row": row, "stage": "extract", "state": "active"})
@@ -567,24 +749,13 @@ class OrchestratedRun:
                 cand["prices"] = [p.model_dump() for p in prices]
                 # Итог по сайту всегда объясняется словами: «пусто» без причины пользователю
                 # ничего не сообщает, а причина у пустого результата всегда есть.
-                if prices:
-                    status, note = sess.STATUS_DONE, "найдено предложений: %d" % len(prices)
-                elif cand.get("on_request"):      # товар на странице есть, цена — по запросу
-                    status, note = sess.STATUS_ON_REQUEST, "товар найден, цена только по запросу"
-                elif timed_out:
-                    status, note = sess.STATUS_ERROR, "таймаут модели — страница не проанализирована"
-                elif cand.get("extract_failed"):
-                    # Технический сбой (пустое тело ответа, неразбираемый JSON) — это НЕ «цены
-                    # здесь нет»: страница не проанализирована. Смешивать их нельзя ни в UI, ни в
-                    # отчёте, иначе сбой выглядит результатом работы.
-                    status = sess.STATUS_ERROR
-                    note = cand.get("extract_reason") or "сбой модели при извлечении"
-                else:
-                    status = sess.STATUS_EMPTY
-                    note = cand.get("extract_reason") or "модель не нашла на странице искомый товар"
+                status, note = sess.status_for_prices(cand, prices, timed_out=timed_out)
                 await self._site(row, cand, status, note=note)
                 await self._check_enough(row)     # набрали подтверждений — дальше не идём
         finally:
+            # Тяжёлый контент страницы живёт в дисковом кэше, а не в кандидате: на тысячах
+            # страниц (в реальной сессии их 6798) удержание html в памяти — сотни мегабайт.
+            cand.pop("fetch", None)
             await self._after(row)
 
     async def _h_adjudicate(self, task, orch):
@@ -648,33 +819,13 @@ class OrchestratedRun:
         написаны и лежат в сессии. Модель здесь и так занята прогоном, лишнего ожидания не
         добавляется, а расход токенов виден там же, где остальной (`usage_delta`).
 
-        Комментарий — не цена: залипший или упавший вызов не имеет права задерживать позицию,
-        поэтому есть таймаут, а при любом отказе берётся детерминированная сводка по источникам
-        (пустой ячейки в отчёте быть не должно).
+        Сама запись (таймаут, запасная сводка, события) — в `report.rationale.write_rationale_safe`:
+        она общая с доразбором вручную открытой страницы.
         """
-        from ..report.rationale import write_rationale
-        row = it.get("row")
+        from ..report.rationale import write_rationale_safe
         cfg = self.settings.report
         llm = None if (self.llm is None or self.orch.stopped or not cfg.use_model) else self.llm
-        try:
-            async with asyncio.timeout(float(getattr(cfg, "rationale_timeout", 60.0))):
-                r = await write_rationale(it, llm_client=llm, model=self.model, cfg=cfg)
-        except TimeoutError:          # отмену прогона НЕ перехватываем — она должна пройти дальше
-            from ..report.rationale import fallback_rationale, offers_from_item
-            from ..report.xlsx import norm_verdict
-            nv = norm_verdict(it.get("verdict"))
-            log.warning("Комментарий по позиции r%s не дождались (%.0fс) — беру сводку по источникам",
-                        row, float(getattr(cfg, "rationale_timeout", 60.0)))
-            r = {"text": fallback_rationale(it, nv, offers_from_item(it, limit=cfg.max_offers_in_comment),
-                                            include_excluded=cfg.include_excluded),
-                 "usage": None, "degraded": True,
-                 "by": "сводка (таймаут %.0f с)" % float(getattr(cfg, "rationale_timeout", 60.0))}
-        it["rationale"] = r["text"]
-        it["rationale_by"] = r.get("by") or ("сводка" if r.get("degraded") else "модель")
-        if r.get("usage"):
-            await _emit(self.emit, {"type": "usage_delta", "usage": r["usage"], "row": row})
-        await _emit(self.emit, {"type": "rationale", "row": row, "text": r["text"],
-                                "degraded": r["degraded"], "by": it["rationale_by"]})
+        await write_rationale_safe(it, llm_client=llm, model=self.model, cfg=cfg, emit=self.emit)
 
     async def _sweep_unfinished(self):
         """Досвести позиции, оставшиеся без свода: у строки ВСЕГДА есть терминальное состояние.
@@ -844,72 +995,171 @@ class OrchestratedRun:
             if self._disc is not None:
                 await self._disc["client"].aclose()
                 self._disc = None
+        return await self._finish("orchestrated")
+
+    async def _finish(self, source: str):
+        """Хвост прогона: досвести незакрытые позиции, дописать историю, отдать метрики.
+
+        Общий для обычного прогона и для прогона-продолжения (`run_open`): результат ручных
+        открытий обязан попасть и в отчёт, и в историю, и в реестр доменов — иначе ручная
+        работа снова оказалась бы «сбоку» от основного пути.
+        """
+        # С этой секунды прогон закрывается и новую работу принимать не имеет права: очередь
+        # уже не обслуживается, а `fetcher` вот-вот закроют. Хвост идёт минутами (досведение,
+        # переспрос модели), и всё это время ссылка на прогон ещё живёт в сессии сервера —
+        # без флага он выдавался за живой, задачи ставились и молча гибли.
+        self.closing = True
         await self._sweep_unfinished()
-        await self._refill_unverified()
+        if not self._remodelled:          # прогон-переизвлечение уже сделал это сам
+            await self._remodel_pending("добор после прогона")
         log.info("Оркестрированный прогон завершён: позиций=%d", len(self.items))
         if getattr(self.settings, "storage", None) and self.settings.storage.enabled:
             from ..storage import persist_run_async     # M5: история (все цены + dead-letter)
-            res = await persist_run_async(self.items, source="orchestrated", cfg=self.settings.storage)
+            res = await persist_run_async(self.items, source=source, cfg=self.settings.storage)
             if res.get("run_id"):
                 await _emit(self.emit, {"type": "history_saved", **res})
+            self._remember_domains()
         await self._report_metrics()
         return self.items
 
-    def _unverified_cands(self) -> list[tuple[dict, dict]]:
-        """Страницы, цена с которых не проверена моделью: [(товар, кандидат)]."""
-        out = []
-        for it in self.items:
-            for cand in it.get("candidates", []):
-                if cand.get("is_file") or not cand.get("prices"):
-                    continue
-                if all(p.get("verified", True) for p in cand["prices"]):
-                    continue
-                out.append((it, cand))
-        return out
+    def _remember_domains(self) -> None:
+        """Пополнить реестр доменов: то, что встретилось, должно появиться в настройках сайтов."""
+        try:
+            from ..storage.domains import remember
+            remember(self.items, cfg=self.settings.storage)
+        except Exception as exc:  # noqa: BLE001 — реестр не важнее результата прогона
+            log.warning("Реестр доменов не пополнен: %s", exc, exc_info=True)
 
-    async def _refill_unverified(self):
-        """Добор: переспросить модель по страницам, где цену пришлось взять из разметки.
+    async def run_open(self, idle_grace: float = 60.0, keep_alive=None):
+        """Прогон-продолжение: очередь пуста на старте, работу докидывают снаружи.
 
-        Страховка на случай, когда шлюз модели (llm/limits.py) всё же исчерпал ожидание —
-        например, платформа была перегружена дольше `llm.degrade_after_s`. Страницы уже лежат
-        в кэше загрузки, сеть не трогаем: платим только за вызовы модели, и только по тем
-        позициям, где иначе в отчёт уедет непроверенное число.
+        Обычный `run()` обходит все позиции и заканчивается, когда очередь опустела. Здесь
+        наоборот: задачи приходят по мере того, как человек открывает заблокированные домены
+        (`submit_grabbed_page` / `unblock_domain`), и прогон обязан ПЕРЕЖИВАТЬ пустую очередь —
+        иначе каждый клик поднимал бы отдельный браузер и отдельный прогон, а именно это и
+        делало ручной режим последовательным.
 
-        Ошибка здесь ничего не рушит: непроверенная цена и так помечена, добор её лишь уточняет.
+        Живём, пока в течение `idle_grace` секунд приходит новая работа; дальше сворачиваемся
+        сами, чтобы не держать открытый Chrome и клиент модели вечно. «Стоп» рвёт цикл сразу.
+
+        `keep_alive` — «работа человека ещё идёт»: пока у него открыто хоть одно ручное окно,
+        тишина в очереди не значит, что делать нечего. Человек проходит капчу в своём темпе, и
+        свернуться под его руками означало бы выбросить забор, который вот-вот случится.
+
+        Повторный вход в `orch.run()` корректен: он сам пересоздаёт потребителей полосы модели
+        в своём `finally`, а счётчик активности сбрасывается в `submit`.
         """
+        self.journal.start(items=len(self.items), model=self.model, mode="manual",
+                           fetch_backend=self.settings.fetch.backend,
+                           fetch_concurrency=self.fetch_cap,
+                           stage_positions=self.stage_caps)
+        log.info("Прогон-продолжение (ручные открытия): вкладок одновременно %d, лимит позиций "
+                 "на этапах %s, ожидание новой работы %.0f с", self.fetch_cap,
+                 ", ".join("%s=%d" % (k, v) for k, v in self.stage_caps.items()), idle_grace)
+        self._load_task = asyncio.create_task(self._stage_load_loop())
+        try:
+            while True:
+                # Сбрасываем ДО круга: задача, поставленная во время `orch.run()`, обязана
+                # оставить взведённый флаг, иначе мы уйдём в хвост, пока она ещё работает.
+                self._new_work.clear()
+                await self.orch.run()              # вернётся, когда очередь опустела
+                if self.orch.stopped:
+                    break
+                if self._new_work.is_set():        # работу докинули, пока мы сворачивались
+                    continue
+                try:
+                    await asyncio.wait_for(self._new_work.wait(), timeout=idle_grace)
+                except asyncio.TimeoutError:
+                    if keep_alive is not None and keep_alive():
+                        log.info("Прогон-продолжение: очередь пуста, но ручные окна открыты — жду")
+                        continue
+                    log.info("Прогон-продолжение: %.0f с без новой работы — завершаюсь",
+                             idle_grace)
+                    break
+        finally:
+            if self._load_task is not None:
+                self._load_task.cancel()
+                await asyncio.gather(self._load_task, return_exceptions=True)
+                self._load_task = None
+        return await self._finish("manual")
+
+    async def run_refill(self, rows: set | None = None):
+        """Прогон-переизвлечение: заново разобрать моделью страницы, лежащие в кэше загрузки.
+
+        Нужен после прогона, у которого посреди работы отвалилась модель: поиск уже оплачен,
+        страницы загружены и лежат на диске, а цены в отчёте — из структурной разметки, «не
+        проверено моделью». Повторять ради этого весь путь (поиск → браузер → загрузка) значит
+        платить второй раз за то, что уже сделано, и снова упереться в антиботы.
+
+        Здесь нет ни обнаружения, ни загрузки: `self._disc` остаётся None, поэтому и добор
+        второй страницы выдачи (`_want_next_page`) сам собой выключен — сеть не трогается вовсе.
+        `rows` — ограничить работу этими номерами строк (проверка на нескольких позициях).
+        """
+        self.journal.start(items=len(self.items), model=self.model, mode="refill",
+                           extract_concurrency=self.settings.extract.concurrency,
+                           stage_positions=self.stage_caps)
+        log.info("Переизвлечение моделью по кэшу страниц: позиций в сессии %d, лимит позиций на "
+                 "этапах %s", len(self.items),
+                 ", ".join("%s=%d" % (k, v) for k, v in self.stage_caps.items()))
+        self._load_task = asyncio.create_task(self._stage_load_loop())
+        try:
+            await self._remodel_pending("запуск по кэшу", rows)
+        finally:
+            if self._load_task is not None:
+                self._load_task.cancel()
+                await asyncio.gather(self._load_task, return_exceptions=True)
+                self._load_task = None
+        return await self._finish("refill")
+
+    def _pending_model_cands(self, rows: set | None = None) -> tuple[list[tuple[dict, dict]], int]:
+        """Страницы, которых модель не разобрала, и число страниц, потерянных для кэша.
+
+        Само правило («что значит — модель не сделала свою работу») живёт в `session.needs_model`:
+        его спрашивает и интерфейс, когда считает страницы для кнопки переизвлечения.
+        """
+        return sess.pending_model_pages(self.items, rows)
+
+    async def _remodel_pending(self, reason: str, rows: set | None = None) -> int:
+        """Переспросить модель по страницам, которые она не разобрала. Возвращает число страниц.
+
+        Страницы уже лежат в `runs/fetch_cache` (их достаёт `extract._fetch_of` по `fetch_key`),
+        сеть не трогаем: платим только за вызовы модели. Деградированные ответы в кэш ответов
+        модели не писались (`storage/extract_cache.py`), поэтому переспрос идёт в модель, а не
+        возвращает ту же деградацию.
+
+        Работа ставится ЗАДАЧАМИ в тот же оркестратор, а не крутится циклом здесь. Так она идёт
+        параллельно (гейт этапа `extract` + адаптивный исполнитель + лимитер запросов), а по
+        обнулению задач позиции сам собой пересчитывается свод и переписывается комментарий.
+        Прежний последовательный добор на реальном прогоне (2532 страницы) занял бы 11–14 часов.
+
+        Свод по затронутым строкам сбрасывается ДО постановки задач: посчитанный свод второй раз
+        не считается, и новая цена никуда не попала бы (тот же приём, что в `unblock_domain`).
+        """
+        self._remodelled = True
         if self.llm is None or self.orch.stopped:
-            return
-        todo = self._unverified_cands()
+            return 0
+        todo, missing = self._pending_model_cands(rows)
+        if missing:
+            log.warning("Переизвлечение (%s): страниц нет в кэше — пропускаю: %d", reason, missing)
         if not todo:
-            return
-        rows = {it["row"] for it, _ in todo}
-        log.info("Добор непроверенных: страниц=%d по %d позициям (страницы из кэша, платим "
-                 "только за модель)", len(todo), len(rows))
-        await _emit(self.emit, {"type": "refill", "state": "start",
-                                "pages": len(todo), "rows": len(rows)})
-        fixed = 0
-        for idx, (it, cand) in enumerate(todo, 1):
-            if self.orch.stopped:
-                break
-            try:
-                prices = await extract_prices(
-                    _ItemView(it), cand, llm_client=self.llm, cfg=self.settings.extract,
-                    model=self.model, emit=self.emit, idx=idx, count=len(todo))
-            except Exception as exc:  # noqa: BLE001 — добор не имеет права уронить готовый прогон
-                log.warning("Добор не удался (%s): %s", cand.get("url", ""), exc)
-                continue
-            if prices and all(p.verified for p in prices):
-                cand["prices"] = [p.model_dump() for p in prices]
-                fixed += 1
-            await _emit(self.emit, {"type": "refill", "state": "progress",
-                                    "done": idx, "pages": len(todo), "fixed": fixed})
-        if fixed:                                    # цены изменились — своды по этим позициям тоже
-            for row in sorted(rows):
-                await self._h_adjudicate(AgentTask(kind="adjudicate", row=row, payload={}),
-                                         self.orch)
-        log.info("Добор непроверенных: уточнено %d страниц из %d", fixed, len(todo))
-        await _emit(self.emit, {"type": "refill", "state": "done",
-                                "pages": len(todo), "fixed": fixed, "rows": len(rows)})
+            log.info("Переизвлечение (%s): переспрашивать нечего", reason)
+            return 0
+        affected = {it["row"] for it, _ in todo}
+        log.info("Переизвлечение (%s): страниц=%d по %d позициям (страницы из кэша, платим "
+                 "только за модель)", reason, len(todo), len(affected))
+        await _emit(self.emit, {"type": "refill", "state": "start", "pages": len(todo),
+                                "rows": len(affected), "missing": missing, "reason": reason})
+        for row in affected:
+            self._adjudicated.discard(row)
+        for it, cand in todo:
+            self._submit("extract", it["row"], {"cand": cand, "refill": True})
+        await self.orch.run()
+        left, _ = self._pending_model_cands(rows)
+        fixed = max(0, len(todo) - len(left))
+        log.info("Переизвлечение (%s): разобрано моделью %d страниц из %d", reason, fixed, len(todo))
+        await _emit(self.emit, {"type": "refill", "state": "done", "pages": len(todo),
+                                "fixed": fixed, "rows": len(affected), "missing": missing})
+        return len(todo)
 
     async def _report_metrics(self) -> None:
         """Итог прогона в цифрах: в журнал, в лог и в UI. Считается ПОСЛЕ всех сводов.
@@ -940,13 +1190,13 @@ class OrchestratedRun:
 
 
 async def run_orchestrated(items, *, settings, fetcher, llm_client=None, model=None, emit=None,
-                           model_lanes: int = 1, budgets: dict | None = None,
+                           budgets: dict | None = None,
                            fetch_concurrency: int | None = None, affix: str | None = None,
                            max_pages: int = 1, stage_positions: int | None = None,
                            enough_confirmations: int = 0):
     """Удобная обёртка: собрать OrchestratedRun и выполнить. Возвращает items со сводами."""
     run = OrchestratedRun(items, settings=settings, fetcher=fetcher, llm_client=llm_client,
-                          model=model, emit=emit, model_lanes=model_lanes, budgets=budgets,
+                          model=model, emit=emit, budgets=budgets,
                           fetch_concurrency=fetch_concurrency, affix=affix, max_pages=max_pages,
                           stage_positions=stage_positions,
                           enough_confirmations=enough_confirmations)

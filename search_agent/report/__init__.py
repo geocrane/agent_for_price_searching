@@ -10,14 +10,15 @@ import asyncio
 from . import checkpoint
 from .rationale import write_rationale
 from .xlsx import (COLUMNS, DETAIL_COLUMNS, SITE_COLUMNS, build_detail_rows, build_row,
-                   build_rows, build_site_rows, money, norm_verdict, write_xlsx)
+                   build_rows, build_site_rows, build_summary_rows, money, norm_verdict,
+                   write_xlsx)
 from ..obs.log import get_logger
 
 log = get_logger("report")
 
 __all__ = ["build_report", "build_rows", "build_row", "build_detail_rows", "build_site_rows",
-           "write_xlsx", "write_rationale", "checkpoint", "COLUMNS", "DETAIL_COLUMNS",
-           "SITE_COLUMNS", "money", "norm_verdict"]
+           "build_summary_rows", "write_xlsx", "write_rationale", "checkpoint", "COLUMNS",
+           "DETAIL_COLUMNS", "SITE_COLUMNS", "money", "norm_verdict"]
 
 
 async def _emit(emit, ev):
@@ -30,7 +31,8 @@ async def _emit(emit, ev):
 
 async def build_report(items: list[dict], path: str, *, llm_client=None, model=None,
                        cfg=None, emit=None, sheet_title: str = "Итоги",
-                       use_model: bool = False) -> dict:
+                       use_model: bool = False, headers: list[str] | None = None,
+                       source_filename: str = "") -> dict:
     """Собрать отчёт по списку товаров (со сводами) и записать .xlsx.
 
     Комментарии по позициям к этому моменту УЖЕ написаны — их пишет прогон сразу после свода
@@ -82,7 +84,10 @@ async def build_report(items: list[dict], path: str, *, llm_client=None, model=N
     rows = build_rows(items)
     detail_rows = build_detail_rows(items)
     site_rows = build_site_rows(items)
-    write_xlsx(rows, path, sheet_title=sheet_title, detail_rows=detail_rows, site_rows=site_rows)
+    summary_columns, summary_rows = build_summary_rows(items, headers=headers,
+                                                       filename=source_filename)
+    write_xlsx(rows, path, sheet_title=sheet_title, detail_rows=detail_rows, site_rows=site_rows,
+               summary_columns=summary_columns, summary_rows=summary_rows)
     with_price = sum(1 for r in rows if r["_found"])
     summary = {"path": path, "total": total, "with_price": with_price,
                "not_found": total - with_price, "sites": len(site_rows)}

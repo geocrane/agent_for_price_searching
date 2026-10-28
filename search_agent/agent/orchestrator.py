@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Оркестратор (§9/M7): очередь задач, одна полоса модели, бюджеты, глобальный стоп.
+"""Оркестратор (§9/M7): очередь задач, бюджеты, глобальный стоп.
 
-Модель — дефицитный ресурс: одна серверная модель генерирует по одному ответу за раз
-(см. решение по проекту). Поэтому МОДЕЛЬНЫЕ задачи (uses_model) идут через приоритетную
-очередь, которую разбирают `model_lanes` потребителей (по умолчанию 1 = строго одна полоса).
-НЕ-модельные задачи (fetch/браузер/парсинг) запускаются сразу и работают параллельно, готовя
-контент, чтобы полоса модели не простаивала.
+Задача, поставленная в `submit`, запускается СРАЗУ и работает параллельно с остальными.
+Собственного лимита у оркестратора нет — и это осознанно: считать работу надо по позициям и по
+ресурсам, а не по числу корутин, чем и занимаются гейты `agent/gates.py` (позиции на этапе,
+вкладки браузера, квота поискового API) и адаптивный исполнитель модели (`llm/executor.py`).
+
+Отдельной «полосы модели» здесь больше нет. Она существовала (приоритетная очередь + N
+потребителей, разбирающих задачи с `uses_model`), но флаг `uses_model` не выставлял НИ ОДИН
+вызов: все задачи шли мимо очереди, полоса стояла пустой, а настройка `model_lanes` в
+config/agent.yaml не делала ничего. Сериализацию модели на деле обеспечивает исполнитель
+(8→4→1 по таймаутам). Читать `submit` как «поставил — побежало» и видеть рядом мёртвый
+механизм, обещающий обратное, — ровно та неоднозначность, из-за которой поведение системы
+переставало быть предсказуемым.
 
 Обработчик задачи регистрируется по kind: `async def handler(task, orch) -> result`. Внутри он
 может докидывать follow-up задачи (`orch.submit(...)`) — так триаж порождает escalate/find_link.
@@ -29,14 +36,11 @@ log = get_logger("agent.orchestrator")
 
 
 class Orchestrator:
-    def __init__(self, *, emit=None, model_lanes: int = 1) -> None:
+    def __init__(self, *, emit=None) -> None:
         self._emit = emit
-        self.model_lanes = max(1, int(model_lanes))
         self.tasks: dict[str, AgentTask] = {}
         self._handlers: dict[str, "callable"] = {}
-        self._mq: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self._free: set[asyncio.Task] = set()
-        self._consumers: list[asyncio.Task] = []
         self._active = 0
         self._idle = asyncio.Event()
         self._idle.set()
@@ -127,7 +131,7 @@ class Orchestrator:
     # ---- постановка задачи ---------------------------------------------------
 
     def submit(self, task: AgentTask) -> AgentTask:
-        """Поставить задачу. Модельная → в очередь одной полосы; не-модельная → сразу параллельно."""
+        """Поставить задачу — она начинает выполняться сразу. Лимиты держат гейты (см. модуль)."""
         self.tasks[task.id] = task
         if self._stopped:
             task.state = TaskState.CANCELLED
@@ -135,12 +139,9 @@ class Orchestrator:
             return task
         self._inc()
         self._emit_soon(task.event())                    # queued (видно в панели очереди)
-        if task.uses_model:
-            self._mq.put_nowait((task.priority, task.seq, task.id))
-        else:
-            t = asyncio.create_task(self._run(task))
-            self._free.add(t)
-            t.add_done_callback(self._free.discard)
+        t = asyncio.create_task(self._run(task))
+        self._free.add(t)
+        t.add_done_callback(self._free.discard)
         return task
 
     # ---- исполнение ----------------------------------------------------------
@@ -175,57 +176,22 @@ class Orchestrator:
                 await self._publish(task.event())
             self._dec()
 
-    async def _consumer(self) -> None:
-        """Полоса модели: берёт по одной задаче из очереди и выполняет до конца (сериализация)."""
-        while True:
-            _prio, _seq, tid = await self._mq.get()
-            try:
-                task = self.tasks.get(tid)
-                if task is not None and task.state == TaskState.QUEUED:
-                    await self._run(task)
-                else:
-                    self._dec()          # задачу уже сняли: без этого _active залипнет навсегда
-            finally:
-                self._mq.task_done()
-
     # ---- жизненный цикл ------------------------------------------------------
 
     async def run(self) -> None:
-        """Запустить полосы модели и ждать, пока все задачи (включая порождённые) завершатся."""
-        self._consumers = [asyncio.create_task(self._consumer()) for _ in range(self.model_lanes)]
-        try:
-            await self._idle.wait()
-        finally:
-            for c in self._consumers:
-                c.cancel()
-            await asyncio.gather(*self._consumers, return_exceptions=True)
-            self._consumers = []
+        """Ждать, пока все задачи (включая порождённые обработчиками) завершатся."""
+        await self._idle.wait()
 
     async def stop(self) -> None:
         """Остановить всю цепочку: отменить активные, очистить очередь, пометить cancelled."""
         self._stopped = True
         log.info("Оркестратор: остановка всей цепочки пользователем")
-        # 1) снять поставленные в очередь модельные задачи
-        while not self._mq.empty():
-            try:
-                _p, _s, tid = self._mq.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            self._mq.task_done()
-            task = self.tasks.get(tid)
-            if task is not None and task.state == TaskState.QUEUED:
-                task.state = TaskState.CANCELLED
-                task.finished = time.time()
-                await self._publish(task.event())
-                self._dec()
-        # 2) отменить бегущие не-модельные задачи и полосы модели (отменит текущую модельную)
+        # 1) отменить бегущие задачи
         for t in list(self._free):
             t.cancel()
-        for c in self._consumers:
-            c.cancel()
-        # 3) дождаться отмен; _idle взведётся, когда _active дойдёт до 0 → run() разблокируется
-        await asyncio.gather(*list(self._free), *self._consumers, return_exceptions=True)
-        # 4) досчитать учёт принудительно. Задача, отменённая ДО первого шага корутины (а мы
+        # 2) дождаться отмен; _idle взведётся, когда _active дойдёт до 0 → run() разблокируется
+        await asyncio.gather(*list(self._free), return_exceptions=True)
+        # 3) досчитать учёт принудительно. Задача, отменённая ДО первого шага корутины (а мы
         # только что сделали ровно это со всем _free), не исполняет свой finally — значит _dec()
         # не вызывается и _active залипает > 0. Тогда `await self._idle.wait()` в run() висит
         # вечно: в webui не закрывается fetcher, session.orchestrated остаётся не-None и кнопка

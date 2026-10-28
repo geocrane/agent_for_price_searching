@@ -8,7 +8,7 @@ const els = {
   dropzone: $("#dropzone"), fileInput: $("#fileInput"), dzText: $("#dzText"), mapSummary: $("#mapSummary"),
   posBody: $("#posBody"),
   runBtn: $("#runBtn"), reportBtn: $("#reportBtn"),
-  resetBtn: $("#resetBtn"), stopBtn: $("#stopBtn"),
+  resetBtn: $("#resetBtn"), stopBtn: $("#stopBtn"), refillBtn: $("#refillBtn"),
   collapseAllBtn: $("#collapseAllBtn"), tableHint: $("#tableHint"),
   queueEmpty: $("#queueEmpty"), qRunning: $("#qRunning"), qQueued: $("#qQueued"), qDone: $("#qDone"),
   modeBtn: $("#modeBtn"), modeModal: $("#modeModal"), modeClose: $("#modeClose"),
@@ -18,6 +18,9 @@ const els = {
   chatStop: $("#chatStop"),
   logConsole: $("#logConsole"), logLevel: $("#logLevel"), logSearch: $("#logSearch"),
   logAutoscroll: $("#logAutoscroll"), logClear: $("#logClear"), traceTools: $("#traceTools"),
+  blockedTab: $("#blockedTab"), blockedTools: $("#blockedTools"), blockedSearch: $("#blockedSearch"),
+  blockedList: $("#blockedList"), blockedEmpty: $("#blockedEmpty"),
+  blockedNoPrice: $("#blockedNoPrice"), blockedGroup: $("#blockedGroup"),
   modelConsole: $("#modelConsole"), modelTools: $("#modelTools"), modelSearch: $("#modelSearch"),
   modelAutoscroll: $("#modelAutoscroll"), modelClear: $("#modelClear"),
   selfTestBtn: $("#selfTestBtn"), testModal: $("#testModal"), testClose: $("#testClose"),
@@ -190,9 +193,10 @@ function _renderUpload(d) {
   stopElapsed(); elapsedFrom = null; renderElapsed(); parsedRows = 0; resetParseWait();   // новый файл — новая задача
   els.reportBtn.disabled = true;                              // сводов ещё нет — отчёт недоступен
   fetchByUrl = {}; manualByUrl = {}; pricesByUrl = {}; siteByUrl = {}; verdictByRow = {}; inspectByUrl = {};
-  resetQueue(); expandedRows.clear(); updateExpandedMode();
+  resetQueue(); refreshBlocked(); expandedRows.clear(); updateExpandedMode();
   els.runBtn.disabled = false;                                // «Найти» активна после загрузки файла
   els.resetBtn.disabled = false;
+  refillPending = 0; els.refillBtn.hidden = true;             // новый файл — переизвлекать нечего
 }
 
 // Одна строка товара в таблице позиций (используется при загрузке и восстановлении сессии).
@@ -261,6 +265,9 @@ els.reportBtn.onclick = async () => {
 function openEvents() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/events`);
+  // Пропущенные за время обрыва события уже не переиграть, поэтому не переигрываем их вовсе:
+  // спрашиваем у сервера текущий список блокировок целиком.
+  ws.onopen = () => refreshBlocked();
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.type === "log") {
@@ -288,12 +295,11 @@ function openEvents() {
     } else if (m.type === "refill") {
       // Добор: переспрашиваем модель по страницам, где цену пришлось взять из разметки.
       if (m.state === "start") {
-        setStatusMsg(`Добор непроверенных: ${m.pages} страниц по ${m.rows} позициям `
-                     + `(страницы из кэша, платим только за модель)`, "busy");
-      } else if (m.state === "progress") {
-        setStatusMsg(`Добор непроверенных: ${m.done} из ${m.pages} · уточнено ${m.fixed}`, "busy");
+        const lost = m.missing ? ` · пропущено ${m.missing} (нет в кэше)` : "";
+        setStatusMsg(`Переизвлечение моделью: ${m.pages} страниц по ${m.rows} позициям `
+                     + `(страницы из кэша, платим только за модель)${lost}`, "busy");
       } else {
-        setStatusMsg(`Добор непроверенных завершён: уточнено ${m.fixed} из ${m.pages} страниц`,
+        setStatusMsg(`Переизвлечение завершено: разобрано моделью ${m.fixed} из ${m.pages} страниц`,
                      m.fixed < m.pages ? "WARNING" : "INFO");
       }
     } else if (m.type === "queries_planned") {
@@ -326,6 +332,15 @@ function openEvents() {
       // прерванного прогона живёт вечно и тикает часами («пакет 2 из 13 — 4:31:23»).
       resetParseWait(); resetModelState(); parsedRows = 0;
       startElapsed(m.started_at);
+      // Прогон может начаться НЕ по кнопке «Найти»: ручное открытие блокировки ставит в очередь
+      // работу по всему домену, а это тысячи страниц. Кнопка «Стоп» обязана быть активной —
+      // иначе начавшийся процесс нечем прервать.
+      showRunning(); els.runBtn.disabled = true; els.refillBtn.disabled = true;
+      if (m.engine === "manual") {
+        setStatusMsg("Продолжение по блокировкам: страницы ушли в очередь — идёт разбор", "busy");
+      } else if (m.engine === "refill") {
+        setStatusMsg("Переизвлечение моделью: страницы из кэша, сайты заново не открываются", "busy");
+      }
     } else if (m.type === "items_parsed") {
       onItemsParsed(m);
     } else if (m.type === "parse_wait") {
@@ -337,7 +352,9 @@ function openEvents() {
     } else if (m.type === "run_done") {
       stopElapsed();
       resetParseWait();                            // прогон кончился — ожидающих пакетов быть не может
-      hideRunning(); els.runBtn.disabled = false; setStatusMsg("Поиск завершён", "INFO");
+      hideRunning(); els.runBtn.disabled = false;
+      setStatusMsg(m.engine === "refill" ? "Переизвлечение завершено" : "Поиск завершён", "INFO");
+      refreshRefill();                             // непроверенных страниц стало меньше (или не осталось)
     } else if (m.type === "price") {
       onPrice(m);
     } else if (m.type === "verdict") {
@@ -447,10 +464,13 @@ document.querySelectorAll(".tab").forEach((tab) => tab.onclick = () => {
   const which = tab.dataset.tab;
   $("#panel-dialog").hidden = which !== "dialog";
   $("#panel-queue").hidden = which !== "queue";
+  $("#panel-blocked").hidden = which !== "blocked";
   $("#panel-trace").hidden = which !== "trace";
   $("#panel-model").hidden = which !== "model";
   els.traceTools.hidden = which !== "trace";
   els.modelTools.hidden = which !== "model";
+  els.blockedTools.hidden = which !== "blocked";
+  if (which === "blocked") refreshBlocked();   // открыли вкладку — показываем свежую правду
 });
 
 // Свернуть все раскрытые товары (возвращает панель справа).
@@ -1127,30 +1147,37 @@ async function openChatById(id) {
 // ---- Режим открытия сайтов (анти-блок уровни) ------------------------------
 // Пресеты зеркалят search_agent/config.py FETCH_PRESETS. Незаданные в пресете поля
 // сохраняют дефолт (см. DEFAULT_MODE). UI — источник истины: на прогон шлём явные поля.
+// По умолчанию — «Максимальный», но БЕЗ человеческого ввода: он тянет за собой одну вкладку
+// (см. FETCH_DEPS ниже и config.py::normalize_fetch), и самый сильный режим открывал сайты
+// строго по одному. Значения полей обязаны совпадать с пресетом `max`: иначе интерфейс покажет
+// выбранным «Максимальный», а работать будет чем-то другим.
 const DEFAULT_MODE = {
-  _v: 4,                                              // версия схемы настроек (см. loadMode)
-  preset: "basic", backend: "browser", real_chrome: true, anti_detect: false, headed: false,
-  persistent_profile: false, warmup: true, human_input: false, wait_networkidle: true,
-  http_first: true,
-  delay_min: 8, delay_max: 25, timeout: 30, top_n_fetch: 0, concurrency: 2,
+  _v: 5,                                              // версия схемы настроек (см. loadMode)
+  preset: "max", backend: "browser", real_chrome: true, anti_detect: true, headed: true,
+  persistent_profile: true, warmup: true, human_input: false, wait_networkidle: true,
+  http_first: false,
+  delay_min: 12, delay_max: 30, timeout: 30, top_n_fetch: 0, concurrency: 4,
   retry_on_block: 1, cooldown_min: 20, cooldown_max: 40,
   _muted: {},                                         // погашенные зависимые: чем были до гашения
 };
 const FETCH_PRESETS = {
   fast:   { backend: "http",    real_chrome: true, anti_detect: false, headed: false, persistent_profile: false, warmup: false, human_input: false, wait_networkidle: true, http_first: true,  delay_min: 2,  delay_max: 6 },
   basic:  { backend: "browser", real_chrome: true, anti_detect: false, headed: false, persistent_profile: false, warmup: true,  human_input: false, wait_networkidle: true, http_first: true,  delay_min: 8,  delay_max: 25 },
-  strong: { backend: "browser", real_chrome: true, anti_detect: true,  headed: false, persistent_profile: true,  warmup: true,  human_input: true,  wait_networkidle: true, http_first: true,  delay_min: 8,  delay_max: 25 },
-  max:    { backend: "browser", real_chrome: true, anti_detect: true,  headed: true,  persistent_profile: true,  warmup: true,  human_input: true,  wait_networkidle: true, http_first: false, delay_min: 12, delay_max: 30 },
+  strong: { backend: "browser", real_chrome: true, anti_detect: true,  headed: false, persistent_profile: true,  warmup: true,  human_input: false, wait_networkidle: true, http_first: true,  delay_min: 8,  delay_max: 25 },
+  max:    { backend: "browser", real_chrome: true, anti_detect: true,  headed: true,  persistent_profile: true,  warmup: true,  human_input: false, wait_networkidle: true, http_first: false, delay_min: 12, delay_max: 30, concurrency: 4 },
 };
 const PRESET_LABEL = { fast: "Быстрый", basic: "Базовый", strong: "Усиленный", max: "Максимальный", custom: "Свой" };
 const PRESET_DESC = {
   fast: "httpx без браузера, короткие паузы. Лёгкие сайты, когда альтернатив много.",
   basic: "Chrome headless + прогрев + ожидание JS + stealth. Прежний режим (~57%).",
-  strong: "+ анти-детект (patchright), постоянный профиль, человеческий ввод, повтор. Без окна.",
-  max: "+ графический режим (реальное окно) = эксперимент (~79%, берёт Ozon/Леруа). Длинные паузы.",
+  strong: "+ анти-детект (patchright), постоянный профиль, повтор. Без окна, параллельно.",
+  max: "+ графический режим (реальное окно): берёт Ozon/Леруа. Длинные паузы, сайты параллельно.",
   custom: "Ручная настройка приёмов и параметров ниже.",
 };
 const MODE_KEY = "webui_fetchmode";
+// Объявлено здесь, а не рядом с loadMode(): `let fetchMode = loadMode()` ниже вызывается сразу,
+// и const, объявленный после этой строки, попадал бы в TDZ — падал весь скрипт интерфейса.
+const MODE_SCHEMA = DEFAULT_MODE._v;   // текущая версия схемы сохранённых настроек
 const FLAGS = ["real_chrome", "anti_detect", "headed", "persistent_profile", "warmup", "human_input", "wait_networkidle", "http_first"];
 const NUMS = ["delay_min", "delay_max", "timeout", "top_n_fetch", "concurrency", "retry_on_block", "cooldown_min", "cooldown_max"];
 // Зеркало search_agent/config.py FETCH_DEPS: приём → что обязано быть включено, иначе он не
@@ -1165,21 +1192,39 @@ let fetchMode = loadMode();
 
 function loadMode() {
   let saved; try { saved = JSON.parse(localStorage.getItem(MODE_KEY) || "null"); } catch (_) {}
-  // Смысл поля «Кандидатов на товар» изменился: было «сколько из отобранных грузить» (в главном
-  // пути не работало), стало «сколько кандидатов выдачи вообще рассматривать, 0 — все». Старое
-  // сохранённое число молча урезало бы выдачу — сбрасываем его один раз.
-  if (saved && ![2, 3, 4].includes(saved._v)) { delete saved.top_n_fetch; saved._v = 4; }
-  // v3: появились связанные группы. Старый blob мог хранить несогласованный набор (например
-  // httpx + анти-детект) — приводим к согласованному при загрузке, а не молча отправляем на сервер.
-  if (saved && saved._v !== 3 && saved._v !== 4) { saved._v = 4; saved._muted = {}; }
-  // v4: появился «Сначала без браузера». В старом blob поля нет, и дефолт (true) противоречил бы
-  // пресету «Максимальный», где лёгкий путь выключен намеренно. Поэтому у сохранённого пресета
-  // берём его значение, а «Свой» получает общий дефолт.
-  if (saved && saved._v === 3) {
-    saved._v = 4;
+  // Лестница миграций идёт по «версия МЕНЬШЕ N», а не по перечислению известных версий: со
+  // списком вида `![2,3,4].includes(_v)` каждая новая версия автоматически попадала в ветку
+  // «схема незнакомая» и на каждой загрузке сбрасывала уже смигрированные поля.
+  const v = saved ? Number(saved._v) || 0 : MODE_SCHEMA;
+  if (saved && v < 2) {
+    // Смысл поля «Кандидатов на товар» изменился: было «сколько из отобранных грузить» (в главном
+    // пути не работало), стало «сколько кандидатов выдачи вообще рассматривать, 0 — все». Старое
+    // сохранённое число молча урезало бы выдачу — сбрасываем его один раз.
+    delete saved.top_n_fetch;
+  }
+  if (saved && v < 3) {
+    // v3: появились связанные группы. Старый blob мог хранить несогласованный набор (например
+    // httpx + анти-детект) — приводим к согласованному, а не молча отправляем на сервер.
+    saved._muted = {};
+  }
+  if (saved && v < 4) {
+    // v4: появился «Сначала без браузера». В старом blob поля нет, и дефолт (true) противоречил бы
+    // пресету «Максимальный», где лёгкий путь выключен намеренно.
     const p = FETCH_PRESETS[saved.preset];
     saved.http_first = p ? p.http_first : DEFAULT_MODE.http_first;
   }
+  if (saved && v < 5) {
+    // v5: «Максимальный» и «Усиленный» больше не включают человеческий ввод. Он принудительно
+    // ставил «Параллельно доменов» = 1, поэтому в сохранённом blob лежит именно единица —
+    // вернуть параллельность обязаны мы, иначе режим так и останется последовательным.
+    // «Свой» не трогаем: там значения выбирал пользователь.
+    if (saved.preset === "max" || saved.preset === "strong") {
+      saved.human_input = false;
+      saved.concurrency = FETCH_PRESETS[saved.preset].concurrency || DEFAULT_MODE.concurrency;
+      if (saved._muted) delete saved._muted.human_input;
+    }
+  }
+  if (saved) saved._v = MODE_SCHEMA;
   const m = Object.assign({}, DEFAULT_MODE, saved || {});
   m._muted = Object.assign({}, m._muted);
   return m;
@@ -1271,25 +1316,52 @@ els.modeClose.onclick = () => { els.modeModal.hidden = true; };
 // подставляется при каждом запуске, поэтому храним его не в localStorage, а в базе пользователя.
 const csv2list = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
 
+/* «Запросы формирует модель» и «Уточнение к запросу» показаны в ДВУХ местах: на главном экране
+   (#llmToggle / #affix) и в настройках (#profLlm / #profAffix). Это одно и то же поле профиля,
+   и держать копии порознь нельзя. Раньше именно это выглядело как «галочка включается сама»:
+   пользователь снимал её на главном экране, открывал настройки и жал «Готово», а saveProfile
+   читал МОДАЛЬНЫЙ чекбокс — он остался включённым — и записывал старое значение обратно.
+   Теперь у обеих копий один сеттер, и правка в любой из них сразу видна во второй. */
+function setUseLlmQueries(on) {
+  const a = $("#llmToggle"), b = $("#profLlm");
+  if (a) a.checked = !!on;
+  if (b) b.checked = !!on;
+}
+
+function setAffix(text, except) {
+  if (except !== "main") els.affix.value = text;         // не трогаем поле, в котором печатают:
+  const b = $("#profAffix");                             // переприсвоение значения уводит курсор
+  if (b && except !== "modal") b.value = text;
+}
+
+// Точечное сохранение профиля: выбор на ГЛАВНОМ экране обязан пережить перезагрузку, а не
+// ждать, пока пользователь зайдёт в настройки и нажмёт «Готово». Патч копится и уходит одним
+// запросом — печать в поле уточнения не должна дёргать сервер на каждую букву.
+let _profPatch = {}, _profTimer = null;
+function saveProfileField(patch) {
+  Object.assign(_profPatch, patch);
+  clearTimeout(_profTimer);
+  _profTimer = setTimeout(async () => {
+    const body = _profPatch; _profPatch = {};
+    try { await postJson("/api/profile", body); }
+    catch (e) { logLine("Профиль поиска не сохранён: " + (e.message || e), "WARNING"); }
+  }, 600);
+}
+
 function fillProfile(p) {
-  $("#profAffix").value = p.affix || "";
-  $("#profLlm").checked = !!p.use_llm_queries;
+  setAffix(p.affix || "");
+  setUseLlmQueries(p.use_llm_queries);
   $("#profSecondPage").checked = p.second_page_if_empty !== false;
   $("#profPreferred").value = (p.preferred_domains || []).join(", ");
   $("#profBlocked").value = (p.blocked_domains || []).join(", ");
   $("#profStrict").checked = !!p.strict_analog;
   $("#profEnough").value = String(p.enough_confirmations ?? 0);
-  if (p.affix && !els.affix.value.trim()) els.affix.value = p.affix;
 }
 
 async function loadProfile() {
   try {
     const d = await (await fetch("/api/profile")).json();
-    if (d && d.profile) {
-      fillProfile(d.profile);
-      els.affix.value = d.profile.affix || els.affix.value;
-      const t = $("#llmToggle"); if (t) t.checked = !!d.profile.use_llm_queries;
-    }
+    if (d && d.profile) fillProfile(d.profile);
   } catch (e) { logLine("Профиль поиска не загружен: " + (e.message || e), "WARNING"); }
 }
 
@@ -1307,21 +1379,31 @@ async function saveProfile() {
       enough_confirmations: Number($("#profEnough").value) || 0,
     });
     fillProfile(d.profile);
-    els.affix.value = d.profile.affix || els.affix.value;
-    const t = $("#llmToggle"); if (t) t.checked = !!d.profile.use_llm_queries;
     toast("Профиль поиска сохранён", "ok");
   } catch (e) {
     err.textContent = String(e.message || e); err.hidden = false;
   }
 }
 
-els.modeSave.onclick = () => { saveMode(); saveClean(); saveProfile(); els.modeModal.hidden = true; };
+// Обе копии правятся в любую сторону; выбор на главном экране сохраняется сразу.
+$("#llmToggle").addEventListener("change", (e) => {
+  setUseLlmQueries(e.target.checked);
+  saveProfileField({ use_llm_queries: e.target.checked });
+});
+$("#profLlm").addEventListener("change", (e) => setUseLlmQueries(e.target.checked));
+els.affix.addEventListener("input", () => {
+  setAffix(els.affix.value, "main");
+  saveProfileField({ affix: els.affix.value.trim() });
+});
+$("#profAffix").addEventListener("input", (e) => setAffix(e.target.value, "modal"));
+
+els.modeSave.onclick = () => { saveMode(); saveClean(); saveProfile(); saveSites(); els.modeModal.hidden = true; };
 els.modeModal.onclick = (e) => { if (e.target === els.modeModal) els.modeModal.hidden = true; };
 els.modeReset.onclick = () => {
   const cleanActive = document.querySelector('.mtab[data-mtab="clean"]').classList.contains("active");
   if (cleanActive) { cleanMode = Object.assign({}, DEFAULT_CLEAN, { _muted: {} }); applyCleanPreset("balanced"); saveClean(); }
   // `_muted` — вложенный объект: копируем отдельно, иначе сброс мутировал бы сам DEFAULT_MODE
-  else { fetchMode = Object.assign({}, DEFAULT_MODE, { _muted: {} }); applyPreset("basic"); saveMode(); }
+  else { fetchMode = Object.assign({}, DEFAULT_MODE, { _muted: {} }); applyPreset(DEFAULT_MODE.preset); saveMode(); }
 };
 
 function currentFetchOpts() {
@@ -1334,6 +1416,102 @@ function currentFetchOpts() {
     retry_on_block: m.retry_on_block, delay_range: [m.delay_min, m.delay_max],
     cooldown_range: [m.cooldown_min, m.cooldown_max],
   };
+}
+
+// ---- Настройки → «Сайты»: реестр доменов -----------------------------------
+// Домены накапливаются сами (прогон дописывает их в реестр), поэтому список читается с сервера,
+// а не собирается из текущей таблицы: сайт, встреченный в прошлый раз, тоже надо уметь пометить.
+const SITE_LEVELS = [["preferred", "приоритетный"], ["normal", "обычный"],
+                     ["lowered", "пониженный"], ["banned", "запрещён"]];
+const SITES_LIMIT = 800;              // столько строк рисуем разом; остальное отсекает поиск
+
+let sitesData = [];                   // [{domain, level, hits, priced, blocked}] с сервера
+let sitesPending = {};                // домен → выбранный уровень (уходит на сервер по «Готово»)
+let sitesLoaded = false;
+
+async function loadSites(force) {
+  if (sitesLoaded && !force) { renderSites(); return; }
+  $("#sitesList").innerHTML = `<div class="sites-empty">Загружаю реестр…</div>`;
+  try {
+    const d = await apiJson("/api/domains");
+    sitesData = d.domains || [];
+    sitesPending = {};
+    sitesLoaded = true;
+    $("#sitesAllowTld").value = (d.allowed_tlds || []).join(", ");
+    $("#sitesBanTld").value = (d.banned_tlds || []).join(", ");
+    renderSites();
+  } catch (e) {
+    $("#sitesList").innerHTML = `<div class="sites-empty">Реестр не загружен: ${esc(e.message || e)}</div>`;
+  }
+}
+
+const siteLevel = (d) => sitesPending[d.domain] || d.level || "normal";
+
+function renderSites() {
+  const q = $("#sitesSearch").value.trim().toLowerCase();
+  const onlyRated = $("#sitesOnlyRated").checked;
+  const rows = sitesData.filter((d) => (!q || d.domain.includes(q))
+                                    && (!onlyRated || siteLevel(d) !== "normal"));
+  const marked = sitesData.filter((d) => siteLevel(d) !== "normal").length;
+  $("#sitesCount").textContent = `показано ${Math.min(rows.length, SITES_LIMIT)} из ${sitesData.length}`
+    + (marked ? ` · помечено ${marked}` : "");
+  if (!rows.length) {
+    $("#sitesList").innerHTML = `<div class="sites-empty">${sitesData.length
+      ? "Ничего не найдено." : "Реестр пуст — домены появятся после первого поиска."}</div>`;
+    return;
+  }
+  const shown = rows.slice(0, SITES_LIMIT);
+  let html = "", letter = null;
+  for (const d of shown) {
+    const ch = (d.domain[0] || "?").toUpperCase();
+    if (ch !== letter) { letter = ch; html += `<div class="sites-letter">${esc(letter)}</div>`; }
+    const lv = siteLevel(d);
+    // Счётчики отвечают на вопрос «а стоит ли этот сайт загрузок»: 40 страниц и ноль цен —
+    // готовый повод понизить его, и это видно без открытия отчёта.
+    const stat = d.hits ? `<span class="sites-stat" title="страниц ${d.hits}, с ценой ${d.priced}, заблокировано ${d.blocked}">`
+                          + `${d.hits}/${d.priced}${d.blocked ? "/⛔" + d.blocked : ""}</span>` : "";
+    html += `<div class="sites-row lv-${lv}" data-domain="${esc(d.domain)}">`
+          + `<span class="sites-dom" title="${esc(d.domain)}">${esc(d.domain)}</span>${stat}`
+          + `<select data-domain="${esc(d.domain)}">`
+          + SITE_LEVELS.map(([v, t]) => `<option value="${v}"${v === lv ? " selected" : ""}>${t}</option>`).join("")
+          + `</select></div>`;
+  }
+  if (rows.length > SITES_LIMIT) {
+    html += `<div class="sites-empty">…и ещё ${rows.length - SITES_LIMIT}. Сузьте поиском.</div>`;
+  }
+  $("#sitesList").innerHTML = html;
+}
+
+$("#sitesList").addEventListener("change", (e) => {
+  const sel = e.target.closest("select[data-domain]"); if (!sel) return;
+  sitesPending[sel.dataset.domain] = sel.value;
+  // Список НЕ перерисовываем: в нём сотни строк, и полная перерисовка отматывала бы его в
+  // начало после каждой пометки — прокликать десяток доменов подряд стало бы невозможно.
+  const row = sel.closest(".sites-row");
+  SITE_LEVELS.forEach(([v]) => row.classList.toggle("lv-" + v, v === sel.value));
+  updateSitesCount();
+  if ($("#sitesOnlyRated").checked && sel.value === "normal") row.remove();   // ушёл из фильтра
+});
+
+function updateSitesCount() {
+  const marked = sitesData.filter((d) => siteLevel(d) !== "normal").length;
+  const c = $("#sitesCount");
+  c.textContent = c.textContent.replace(/ · помечено \d+$/, "") + (marked ? ` · помечено ${marked}` : "");
+}
+$("#sitesSearch").oninput = debounce(renderSites, 200);
+$("#sitesOnlyRated").onchange = renderSites;
+
+async function saveSites() {
+  if (!sitesLoaded) return;             // вкладку не открывали — сохранять нечего
+  const body = { levels: sitesPending,
+                 allowed_tlds: csv2list($("#sitesAllowTld").value),
+                 banned_tlds: csv2list($("#sitesBanTld").value) };
+  const changed = Object.keys(sitesPending).length;
+  try {
+    await postJson("/api/domains", body);
+    if (changed) toast(`Реестр сайтов: обновлено доменов — ${changed}`, "ok");
+    sitesLoaded = false;                // при следующем открытии перечитаем с сервера
+  } catch (e) { toast("Реестр сайтов не сохранён: " + (e.message || e), "err"); }
 }
 
 // ---- Сценарий очистки контента (зеркалит search_agent/config.py CLEAN_PRESETS) -------------
@@ -1428,6 +1606,10 @@ document.querySelectorAll(".mtab").forEach((tab) => tab.onclick = () => {
   $("#mpanel-open").hidden = which !== "open";
   $("#mpanel-clean").hidden = which !== "clean";
   $("#mpanel-profile").hidden = which !== "profile";
+  $("#mpanel-sites").hidden = which !== "sites";
+  // Реестр — многоколоночный список на сотни доменов: в узкой модалке он нечитаем.
+  $("#modeModalBox").classList.toggle("xwide", which === "sites");
+  if (which === "sites") loadSites();
 });
 
 // ---- Переочистить кэш выбранным сценарием (без повторного захода на сайты) -----------------
@@ -1464,6 +1646,43 @@ els.runBtn.onclick = async () => {
   }
 };
 
+// ---- Переизвлечь моделью по кэшу страниц ------------------------------------
+// Прогон, у которого посреди работы отвалилась модель, оставляет цены «не проверено моделью» и
+// сайты с причиной «модель недоступна». Поиск за них уже оплачен, страницы лежат на диске —
+// кнопка переспрашивает по ним модель, не открывая сайты заново.
+let refillPending = 0;
+
+async function refreshRefill() {
+  try {
+    const d = await apiJson("/api/refill/preview");
+    refillPending = (d && d.pages) || 0;
+    els.refillBtn.hidden = refillPending === 0;
+    els.refillBtn.textContent = `↻ Переизвлечь (${refillPending})`;
+    els.refillBtn.disabled = !!(d && d.running);
+  } catch (e) {
+    els.refillBtn.hidden = true;                   // нечего показывать — молчим, это не ошибка работы
+  }
+}
+
+els.refillBtn.onclick = async () => {
+  const d = await apiJson("/api/refill/preview").catch(() => null);
+  if (!d || !d.pages) { toast("Переизвлекать нечего: все страницы уже разобраны моделью.", ""); await refreshRefill(); return; }
+  const lost = d.missing ? `\n\nЕщё ${d.missing} стр. пропущу: их нет в кэше — такие нужно грузить заново кнопкой «Найти».` : "";
+  if (!confirm(`Переизвлечь моделью ${d.pages} стр. по ${d.rows} позициям?\n\n`
+             + `Страницы берутся из кэша: сайты заново не открываются и поиск не повторяется — `
+             + `платим только за вызовы модели. Цены, которые модель не подтвердит, будут убраны, `
+             + `а итоговая цена и комментарий по этим позициям пересчитаны.${lost}`)) return;
+  els.refillBtn.disabled = true; showRunning();
+  setStatusMsg(`Переизвлечение: проверяю связь с моделью…`, "busy");
+  try {
+    const r = await postJson("/api/refill", {});
+    toast(`Переизвлечение запущено: ${r.pages} стр. по ${r.rows} позициям`, "ok");
+  } catch (e) {
+    setStatusMsg("Ошибка: " + (e.message || e), "ERROR"); toast(String(e.message || e), "err");
+    els.refillBtn.disabled = false; hideRunning();
+  }
+};
+
 // ---- Сбросить прогресс (с предупреждением) ----------------------------------
 els.resetBtn.onclick = async () => {
   if (!confirm("Сбросить весь прогресс поиска?\n\nБудут стёрты найденные источники, загрузки, извлечённые цены и своды по всем товарам. Действие необратимо.")) return;
@@ -1485,10 +1704,11 @@ function clearSessionUI() {
   els.posBody.innerHTML = `<tr class="empty-row"><td colspan="7">Загрузите файл — здесь появятся товары.</td></tr>`;
   posRows = {}; posCandidates = {}; srcFound = 0;
   fetchByUrl = {}; manualByUrl = {}; pricesByUrl = {}; siteByUrl = {}; verdictByRow = {}; inspectByUrl = {};
-  resetQueue(); expandedRows.clear(); updateExpandedMode();
+  resetQueue(); renderBlocked(); expandedRows.clear(); updateExpandedMode();
   els.mapSummary.hidden = true;
   els.cTotal.textContent = els.cFound.textContent = els.cAnalog.textContent = els.cNone.textContent = 0;
   els.runBtn.disabled = true; els.reportBtn.disabled = true; els.resetBtn.disabled = true;
+  refillPending = 0; els.refillBtn.hidden = true;
   els.dzText.textContent = "Перетащите Excel/CSV или нажмите для выбора";
   hideRunning(); setStatusMsg("Прогресс сброшен · загрузите файл", "INFO");
 }
@@ -1695,7 +1915,9 @@ function onSiteUpdate(m) {
   siteByUrl[m.url] = {
     status: m.status, chars: m.chars, found: m.found, match: m.match,
     price: m.price, comment: m.comment, note: m.note, domain: m.domain,
+    on_request: !!m.on_request, reblocked: !!m.reblocked,
   };
+  scheduleBlockedRender();          // страница могла попасть в блокировки или уйти из них
   const tr = posRows[m.row]; if (!tr) return;
   const nx = tr.nextElementSibling;
   if (nx && nx.classList.contains("cand-row") && nx.dataset.row === String(m.row)) {
@@ -1792,9 +2014,8 @@ function renderQueue() {
   const row = (t) => {
     const lbl = taskLabels[t.kind] || t.kind;
     const rw = t.row != null ? ` · стр.${t.row}` : "";
-    const model = t.uses_model ? ' <span class="qm">модель</span>' : "";
     const state = t.state === "blocked" ? "ждёт этап" : t.state;
-    return `<div class="qitem st-${t.state}"><span class="qk">${lbl}${rw}</span>${model}<span class="qs">${state}</span></div>`;
+    return `<div class="qitem st-${t.state}"><span class="qk">${lbl}${rw}</span><span class="qs">${state}</span></div>`;
   };
   const render = (list, tail) => {
     const shown = tail ? list.slice(-QUEUE_LIMIT).reverse() : list.slice(0, QUEUE_LIMIT);
@@ -1808,9 +2029,165 @@ function renderQueue() {
 }
 function resetQueue() { taskById = {}; els.qRunning.innerHTML = els.qQueued.innerHTML = els.qDone.innerHTML = ""; els.queueEmpty.hidden = false; }
 
+// ---- Блокировки: страницы, которые может открыть только человек ------------
+// СПИСОК ПРИХОДИТ С СЕРВЕРА (`GET /api/blocked`) и только оттуда. Раньше он собирался здесь же,
+// из накопленного снимка событий, — то есть «что считать блокировкой» было реализовано дважды,
+// на сервере и в браузере, и эти две реализации никогда не сверялись. Стоило оборваться
+// сокету (события `site_update` и `manual` при переподключении не переигрываются) — и список
+// расходился с действительностью до перезагрузки страницы: сайт, который человек только что
+// открыл руками, продолжал висеть в «Блокировках».
+//
+// Группируем ПО ДОМЕНУ: капча решается один раз на домен, а страниц у него обычно несколько.
+let blockedGroupBy = "domain";               // "domain" — одна проверка на много страниц; "item" — по товару
+let blockedCache = [];                       // последний ответ сервера (рисуем из него без запроса)
+
+/** Есть ли по позиции итоговая цена. «Цена по запросу» ценой НЕ считается: сравнивать её не с
+ *  чем, и именно такие позиции пользователь и хочет дожать вручную. */
+function rowHasPrice(row) {
+  const v = verdictByRow[row];
+  return !!(v && v.primary != null);
+}
+
+function blockedPass(p) {
+  if (els.blockedNoPrice.checked && rowHasPrice(p.row)) return false;
+  const q = els.blockedSearch.value.trim().toLowerCase();
+  return !q || (p.domain + " " + p.name).toLowerCase().includes(q);
+}
+
+let blockedRaf = 0;
+/** Перезапросить список у сервера. Событий site_update много — склеиваем их по кадру. */
+function scheduleBlockedRender() {
+  if (blockedRaf) return;
+  blockedRaf = requestAnimationFrame(() => { blockedRaf = 0; refreshBlocked(); });
+}
+
+async function refreshBlocked() {
+  try {
+    const r = await fetch("/api/blocked");
+    const d = await r.json();
+    blockedCache = (d && d.pages) || [];
+  } catch (e) { return; }                    // сервер недоступен — оставляем прошлый снимок
+  renderBlocked();
+}
+
+const againBadge = (p) => p.reblocked
+  ? `<span class="blk-again" title="Домен уже открывали вручную, и он закрылся снова — остальные его страницы открываются только вручную">повторно</span>` : "";
+
+// Что сейчас с ручным окном этой страницы. Состояние приходит вместе со списком, поэтому
+// переживает и переподключение сокета, и перезагрузку страницы.
+const MANUAL_STATE_LABEL = {
+  opening: "открываю…",
+  loading: "загружается…",
+  blocked: "ждёт вас: пройдите проверку",
+  surfed: "открыт другой сайт",
+  timeout: "не дождались — откройте снова",
+  analyze_failed: "не удалось поставить в работу",
+};
+
+function manualBadge(p) {
+  const label = MANUAL_STATE_LABEL[p.manual_state];
+  if (!label) return "";
+  const cls = (p.manual_state === "blocked" || p.manual_state === "surfed") ? " wait" : "";
+  return `<span class="blk-manual${cls}" title="${esc(p.manual_note || "")}">${esc(label)}</span>`;
+}
+
+function renderBlocked() {
+  const all = blockedCache;
+  els.blockedTab.textContent = all.length ? `Блокировки (${all.length})` : "Блокировки";
+  const pages = all.filter(blockedPass);
+  if (!pages.length) {
+    els.blockedList.innerHTML = "";
+    els.blockedEmpty.hidden = false;
+    els.blockedEmpty.textContent = all.length
+      ? "Ничего не найдено по фильтру." : "Заблокированных сайтов нет.";
+    return;
+  }
+  els.blockedEmpty.hidden = true;
+  els.blockedList.innerHTML = blockedGroupBy === "item"
+    ? renderBlockedByItem(pages) : renderBlockedByDomain(pages);
+}
+
+/** По домену: капча решается один раз на домен, и одна проверка закрывает все его страницы. */
+function renderBlockedByDomain(pages) {
+  const byDomain = {};
+  pages.forEach((p) => { (byDomain[p.domain] = byDomain[p.domain] || []).push(p); });
+  // Домены с бóльшим числом страниц — выше: одна капча там закрывает больше работы.
+  const domains = Object.keys(byDomain).sort((a, b) => byDomain[b].length - byDomain[a].length
+                                                    || a.localeCompare(b));
+  return domains.map((dom) => {
+    const list = byDomain[dom];
+    const state = list.find((p) => p.note) || {};
+    const again = list.some((p) => p.reblocked);
+    const head =
+      `<div class="blk-head">` +
+        `<span class="blk-dom">${esc(dom || "?")}</span>` +
+        `<span class="blk-count">${list.length} стр.</span>` +
+        (again ? againBadge({ reblocked: true })
+               : `<span class="blk-why" title="${esc(state.note || "")}">${esc(shortReason(state.note))}</span>`) +
+      `</div>`;
+    const rows = list.map((p) =>
+      `<div class="blk-item"><a class="blk-page" data-url="${esc(p.url)}" ` +
+      `title="Открыть в нашем окне: пройдите проверку — страницу заберут, вкладка закроется">` +
+      `стр. ${p.row}</a> <span class="blk-name">${esc(p.name)}</span>${manualBadge(p)}</div>`).join("");
+    return `<div class="blk-group${again ? " again" : ""}">${head}${rows}</div>`;
+  }).join("");
+}
+
+/** По товару: «покажи всё заблокированное по этой позиции и дай прокликать именно её».
+ *  Страницы одной позиции лежат на РАЗНЫХ доменах, поэтому кнопка открытия — у каждой строки. */
+function renderBlockedByItem(pages) {
+  const byRow = {};
+  pages.forEach((p) => { (byRow[p.row] = byRow[p.row] || []).push(p); });
+  const rows = Object.keys(byRow).sort((a, b) => Number(a) - Number(b));
+  return rows.map((row) => {
+    const list = byRow[row];
+    const again = list.some((p) => p.reblocked);
+    const priced = rowHasPrice(row);
+    const head =
+      `<div class="blk-head">` +
+        `<span class="blk-dom" title="${esc(list[0].name)}">#${row} · ${esc(list[0].name)}</span>` +
+        `<span class="blk-count">${list.length} стр.</span>` +
+        `<span class="blk-why">${priced ? "цена есть" : "цены нет"}</span>` +
+      `</div>`;
+    const items = list.map((p) => `<div class="blk-item">${blockedItemRow(p)}</div>`).join("");
+    return `<div class="blk-group${again ? " again" : ""}">${head}${items}</div>`;
+  }).join("");
+}
+
+function blockedItemRow(p) {
+  return `<a class="mico blk-page" data-url="${esc(p.url)}" title="Открыть в нашем окне: пройдите проверку — страницу заберут, вкладка закроется">⧉</a>` +
+         `<span class="blk-item-name" title="${esc(p.url)}">${esc(p.domain || p.url)}</span>` +
+         againBadge(p) + manualBadge(p);
+}
+
+// Во вкладке РОВНО ОДНО действие: клик по странице открывает её в нашем окне. Кнопки «повторить
+// домен» здесь больше нет намеренно — она делала то же самое, что теперь происходит само при
+// первом успешном заборе, но в обход решения «первый раз или повторная блокировка», и была тем
+// самым непонятным местом, где «включалась какая-то логика очереди».
+els.blockedList.addEventListener("click", (e) => {
+  const pg = e.target.closest(".blk-page");
+  if (pg) manualOpen(pg.dataset.url);
+});
+
+function shortReason(note) {                 // «антибот/блок: http_403» → «http_403»
+  const s = String(note || "");
+  const m = s.match(/(http_\d+|captcha\/antibot|empty)/);
+  return m ? m[1] : (s.includes("вручную") ? "ждёт открытия" : "");
+}
+
+els.blockedSearch.oninput = debounce(renderBlocked, 200);
+els.blockedNoPrice.onchange = renderBlocked;
+els.blockedGroup.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-group]"); if (!b) return;
+  blockedGroupBy = b.dataset.group;
+  els.blockedGroup.querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
+  renderBlocked();
+});
+
 // Свод по товару (M4): итоговая цена + диапазон в колонке «Цена» + счётчики.
 function onVerdict(m) {
   verdictByRow[m.row] = m;
+  scheduleBlockedRender();         // фильтр «только без цены» зависит от свода
   renderVerdictCell(m.row, m);
   recountVerdicts();
   els.reportBtn.disabled = false;                   // есть хотя бы один свод — отчёт доступен
@@ -1939,13 +2316,15 @@ function toggleExpand(row) {
 }
 
 const SITE_STATUS_LABEL = {
-  discovered: "ожидает", fetching: "загрузка…", fetched: "загружено", extracting: "извлечение…",
+  discovered: "ожидает", queued: "в очереди", fetching: "загрузка…", fetched: "загружено",
+  extracting: "извлечение…",
   done: "готово", on_request: "цена по запросу", empty: "цена не найдена",
-  blocked: "блокировка", error: "ошибка", file: "файл", skipped: "не понадобился",
+  blocked: "блокировка", manual_wait: "ждёт ручного открытия",
+  error: "ошибка", file: "файл", skipped: "не понадобился",
 };
 const SITE_STATUS_CLASS = {
-  done: "ok", on_request: "ok", empty: "warn", blocked: "blk", error: "blk",
-  fetching: "busy", extracting: "busy", skipped: "warn",
+  done: "ok", on_request: "ok", empty: "warn", blocked: "blk", manual_wait: "warn", error: "blk",
+  fetching: "busy", extracting: "busy", queued: "busy", skipped: "warn",
 };
 
 // Слить статус сайта из site_update + fetch/manual/цен (обратная совместимость и восстановление).
@@ -2044,13 +2423,21 @@ function manualCtlHtml(url) {
   const grabNow = `<a class="mico manual-grab" data-url="${esc(url)}" title="Забрать содержимое прямо сейчас (если проверка уже пройдена)">⤓</a>`;
   const closeWin = `<a class="mico manual-close" data-url="${esc(url)}" title="Закрыть окно">✕</a>`;
   if (s === "busy") return `<span class="mico wait" title="${esc(m.note || "…")}">⏳</span>`;
-  if (s === "watching" || s === "blocked" || s === "surfed" || s === "timeout") {
+  if (s === "opening" || s === "loading" || s === "blocked" || s === "surfed" || s === "timeout") {
     // Окно открыто: авто-забор идёт сам, иконки — подстраховка (забрать сейчас / переоткрыть / закрыть).
-    const spin = (s === "watching" || s === "blocked")
+    const spin = (s === "opening" || s === "loading" || s === "blocked")
       ? `<span class="mico wait" title="${esc(m.note || "ждём прохождения проверки")}">⏳</span>` : "";
     return spin + grabNow + open + closeWin;
   }
-  if (s === "grabbed") return open + closeWin;      // забрано; окно осталось открытым — закрывает человек
+  if (s === "analyzing") {                          // страница забрана, идёт разбор и пересчёт итога
+    return `<span class="mico wait" title="${esc(m.note || "разбираю страницу…")}">⏳</span>` + open;
+  }
+  // Забрано/в очереди: вкладку закрыл сам инструмент (страница прочитана), закрывать нечего —
+  // работа продолжается в общей очереди, её видно во вкладке «Очередь».
+  if (s === "grabbed" || s === "queued") {
+    return `<span class="mico wait" title="${esc(m.note || "страница в очереди на извлечение")}">⏳</span>` + open;
+  }
+  if (s === "analyzed" || s === "analyze_failed") return open;
   return open;                                      // idle / undefined / closed
 }
 
@@ -2065,9 +2452,12 @@ function cssEsc(s) { return String(s).replace(/["\\]/g, "\\$&"); }
 async function manualOpen(url) {
   setManual(url, { state: "busy", note: "открываю окно…" });
   try {
-    await postJson("/api/manual/open", { url });
-    setManual(url, { state: "watching", note: "окно открыто — пройдите проверку, страница заберётся сама" });
-    setStatusMsg("Ручной режим: окно открыто — пройдите проверку, страница заберётся сама (окно закройте сами)", "busy");
+    // Режим открытия живёт в localStorage браузера, а прогон-продолжение сервер поднимает сам —
+    // передаём выбор пользователя, иначе домен догружался бы не тем режимом, что выбран в UI.
+    await postJson("/api/manual/open", { url, opts: currentFetchOpts(), clean_opts: currentCleanOpts() });
+    setManual(url, { state: "opening", note: "окно открыто — пройдите проверку, страница заберётся сама" });
+    setStatusMsg("Ручной режим: окно открыто — пройдите проверку. Страница заберётся сама, "
+                 + "вкладка закроется, а сайт и остальные страницы домена уйдут в очередь", "busy");
   } catch (e) {
     setManual(url, { state: "idle", note: "не открылось: " + (e.message || e) });
     toast(String(e.message || e), "err");
@@ -2083,7 +2473,7 @@ async function manualGrab(url) {                    // override «забрать
     toast("Забрано: " + r.chars + " симв.", "ok");
     rerenderCard(url);
   } catch (e) {
-    setManual(url, { state: "watching", note: "ошибка: " + (e.message || e) });
+    setManual(url, { state: "timeout", note: "ошибка: " + (e.message || e) });
     toast(String(e.message || e), "err");
   }
 }
@@ -2095,7 +2485,12 @@ async function manualClose(url) {
   manualByUrl[url] = {}; rerenderCard(url);
 }
 
-// События ручного режима от наблюдателя (WS): watching/surfed/blocked/grabbed/timeout/closed
+// События ручного режима от наблюдателя (WS): opening/loading/surfed/blocked/grabbed/timeout/closed,
+// а после забора — queued (страница и остальные страницы её домена ушли в общую очередь) либо
+// analyze_failed. Отдельного «разобрано» больше нет: разбор идёт обычным конвейером, и о его
+// ходе говорят те же события, что и при поиске (site_update / verdict / task).
+const MANUAL_LEVEL = { grabbed: "INFO", queued: "INFO", timeout: "WARNING", analyze_failed: "WARNING" };
+
 function onManualEvent(m) {
   const url = m.url;
   if (m.state === "closed") { manualByUrl[url] = {}; rerenderCard(url); return; }
@@ -2103,9 +2498,14 @@ function onManualEvent(m) {
   if (m.chars != null) patch.chars = m.chars;
   if (m.current) patch.current = m.current;
   setManual(url, patch);
-  if (m.note) setStatusMsg("Ручной режим: " + m.note,
-    m.state === "grabbed" ? "INFO" : (m.state === "timeout" ? "WARNING" : "busy"));
-  if (m.state === "grabbed") { toast("Забрано автоматически: " + m.chars + " симв.", "ok"); rerenderCard(url); }
+  if (m.note) setStatusMsg("Ручной режим: " + m.note, MANUAL_LEVEL[m.state] || "busy");
+  scheduleBlockedRender();         // состояние окна видно СТРОКОЙ списка, а не общим статусом
+  if (m.state === "grabbed") {
+    toast("Забрано: " + m.chars + " симв. — вкладка закрыта", "ok");
+    rerenderCard(url);
+  }
+  if (m.state === "queued") { toast(m.note || "Страница в очереди", "ok"); rerenderCard(url); }
+  if (m.state === "analyze_failed") toast("Не удалось поставить в очередь: " + (m.note || "?"), "err");
 }
 
 function rerenderCard(url) {                        // перерисовать строку(и), где есть эта карточка
@@ -2147,7 +2547,18 @@ async function restoreSession() {
   let d;
   try { d = await apiJson("/api/session"); }
   catch (e) { setStatusMsg("Прошлая сессия не восстановлена: " + (e.message || e), "WARNING"); return; }
-  if (!d || !d.ok || !d.items || !d.items.length) return;
+  if (!d || !d.ok) return;
+  if (!d.items || !d.items.length) {
+    // Товаров в сессии нет, но файл прогресса на диске остаться мог: прогон, доработавший после
+    // сброса, сохранял пустую сессию. Гасить кнопку сброса в этом случае нельзя — включается она
+    // только загрузкой файла, и стереть такой остаток из интерфейса становилось нечем.
+    els.resetBtn.disabled = !d.has_saved;
+    // Подсказку пишем в строку под областью загрузки, а не в строку статуса: та живёт потоком
+    // логов и затирается первым же служебным сообщением через доли секунды.
+    if (d.has_saved) els.dzText.textContent = "Прошлая сессия пуста, но файл прогресса остался — "
+      + "сотрите его кнопкой «Сбросить прогресс» или загрузите файл";
+    return;
+  }
   buildPositions(d.items.map((it) => ({ row: it.row, name: it.name })));
   for (const it of d.items) {
     const list = (it.candidates || []).map((c) => ({
@@ -2156,7 +2567,8 @@ async function restoreSession() {
     posCandidates[it.row] = { list, queries: it.queries || [] };
     for (const c of (it.candidates || [])) {
       siteByUrl[c.url] = { status: c.status, chars: c.chars, found: c.found, match: c.match,
-                           price: c.price, comment: c.comment, note: c.note, domain: c.domain };
+                           price: c.price, comment: c.comment, note: c.note, domain: c.domain,
+                           on_request: !!c.on_request, reblocked: !!c.reblocked };
       if (c.blocked) fetchByUrl[c.url] = { blocked: c.blocked, chars: c.chars };
     }
     restoreStages(it.row, it);                    // восстановить цветные кружки стадий
@@ -2173,11 +2585,13 @@ async function restoreSession() {
     }
   }
   recountVerdicts();
+  refreshBlocked();                // после F5 список заблокированных спрашиваем у сервера
   // Прогон продолжается в фоне (страницу могли просто перезагрузить) — таймер идёт дальше
   // от исходной отметки, а не с нуля.
   if (d.running && d.started_at) startElapsed(d.started_at);
   els.runBtn.disabled = false; els.resetBtn.disabled = false;
   els.reportBtn.disabled = Object.keys(verdictByRow).length === 0;
+  refreshRefill();                 // после F5 кнопка переизвлечения должна знать своё число
   els.dzText.textContent = (d.filename || "прошлая сессия") + " · восстановлено · загрузите другой";
   setStatusMsg("Восстановлена прошлая сессия: " + d.items.length + " товаров (продолжайте кнопкой «Найти»)", "INFO");
 }
@@ -2185,7 +2599,7 @@ async function restoreSession() {
 // Восстановить цветные кружки стадий (query/fetch/extract/match) из статусов кандидатов.
 function restoreStages(row, it) {
   const cands = (it.candidates || []).filter((c) => !c.is_file);
-  const term = (s) => ["done", "empty", "blocked", "error"].includes(s);
+  const term = (s) => ["done", "empty", "blocked", "manual_wait", "error"].includes(s);
   const st = cands.map((c) => c.status || "discovered");
   if ((it.candidates || []).length || (it.queries || []).length) setStage(row, "query", "done");
   if (st.some((s) => s !== "discovered")) setStage(row, "fetch", st.every(term) ? "done" : "active");

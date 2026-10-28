@@ -37,6 +37,27 @@ def _lease_drop() -> None:
     _PROFILE_LEASE = None
 
 
+def _lease_died(ctx) -> None:
+    """Контекст аренды закрылся — забыть её, чтобы следующий потребитель поднял свой Chrome.
+
+    Окно постоянного профиля закрывает ЧЕЛОВЕК (крестиком, после ручного прохождения капчи), и
+    Playwright об этом не сообщает: объект контекста остаётся, а любая операция на нём падает
+    TargetClosedError. Аренда же продолжала раздаваться новым потребителям — каждый получал труп.
+    В реальном логе так набралось 4076 подряд «загрузка не удалась»: ВСЕ сайты выглядели
+    заблокированными, хотя дело было в мёртвом браузере, а не в антиботе.
+    """
+    global _PROFILE_LEASE
+    if _PROFILE_LEASE is not None and _PROFILE_LEASE.get("ctx") is ctx:
+        log.warning("Браузер: окно постоянного профиля закрыто — аренда снята, "
+                    "следующая загрузка поднимет Chrome заново")
+        _PROFILE_LEASE = None
+
+
+def _lease_alive() -> bool:
+    """Есть ли аренда, которой можно пользоваться."""
+    return _PROFILE_LEASE is not None
+
+
 def _clear_stale_singleton(profile_dir: str) -> None:
     """Снять устаревший SingletonLock профиля, если процесс, который его держал, уже мёртв.
 
@@ -94,7 +115,7 @@ class Browser:
         global _PROFILE_LEASE
         # Постоянный профиль уже открыт кем-то (ручное окно или другой прогон) — не падаем и не
         # запускаем второй Chrome на тот же каталог, а работаем в том же контексте своими вкладками.
-        if self.cfg.persistent_profile and _PROFILE_LEASE is not None:
+        if self.cfg.persistent_profile and _lease_alive():
             # Исключение — когда нам нужно ВИДИМОЕ окно (ручной режим), а живой контекст headless:
             # подключаться нельзя, человек просто не увидит окна. Говорим об этом прямо.
             if self.cfg.headed and not _PROFILE_LEASE["headed"]:
@@ -165,6 +186,12 @@ class Browser:
         if self._owns_profile:                           # мы открыли профиль — заводим аренду
             _PROFILE_LEASE = {"pw": self._pw, "ctx": self._ctx, "browser": self._browser,
                               "headed": bool(self.cfg.headed), "users": 1}
+            # Человек закроет окно — аренда обязана исчезнуть вместе с ним (см. _lease_died).
+            ctx = self._ctx
+            try:
+                ctx.on("close", lambda *_a: _lease_died(ctx))
+            except Exception:  # noqa: BLE001 — подписка не критична, есть ещё лечение в _new_page
+                pass
 
         if not self.cfg.anti_detect:                 # ручной стелс только для обычного playwright
             await self._ctx.add_init_script(_STEALTH_JS)
@@ -178,6 +205,28 @@ class Browser:
                  " +headed" if self.cfg.headed else " (headless)",
                  " +profile" if self.cfg.persistent_profile else "")
         return self
+
+    async def _new_page(self):
+        """Новая вкладка. Умер контекст — поднимаем браузер заново и пробуем ЕЩЁ РАЗ.
+
+        Без этого одна смерть окна превращалась в лавину: `new_page()` падал TargetClosedError,
+        `fetcher` записывал «загрузка не удалась», страница получала статус блокировки — и так по
+        всей очереди. Пользователь видел «все сайты заблокированы», хотя ни один антибот не
+        срабатывал. Повтор ровно один: если и свежий Chrome не даёт вкладку, это настоящая
+        поломка, и молчать о ней нельзя.
+        """
+        try:
+            return await self._ctx.new_page()
+        except Exception as exc:  # noqa: BLE001
+            if "closed" not in str(exc).lower():
+                raise                                   # не про смерть контекста — не наше лечение
+            log.warning("Браузер: контекст закрыт (%s) — поднимаю заново", exc)
+            _lease_drop()
+            self._ctx = self._browser = self._pw = None
+            self._borrowed = self._owns_profile = False
+            self._warmed.clear()                        # у нового Chrome куки прогрева свои
+            await self.start()
+            return await self._ctx.new_page()
 
     async def _human(self, page):
         if not self.cfg.human_input:
@@ -206,7 +255,7 @@ class Browser:
         if dom in self._warmed:
             return
         self._warmed.add(dom)
-        page = await self._ctx.new_page()
+        page = await self._new_page()
         try:
             await page.goto("%s://%s/" % (parts.scheme or "https", dom),
                             wait_until="domcontentloaded", timeout=20000)
@@ -227,7 +276,7 @@ class Browser:
         ждать нечего; если нет — отрабатываем прежний тяжёлый путь целиком.
         """
         timeout = timeout or self.cfg.timeout
-        page = await self._ctx.new_page()
+        page = await self._new_page()
         try:
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             status = resp.status if resp else None

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>search_agent · поиск цен</title>
-  <link rel="stylesheet" href="/styles.css?v=22" />
+  <link rel="stylesheet" href="/styles.css?v=24" />
 </head>
 <body>
   <!-- ================= Топбар ================= -->
@@ -110,6 +110,7 @@
         <div class="run-actions">
           <button class="btn primary" id="runBtn" title="Агент сам пройдёт весь путь по товарам: найдёт источники, загрузит все сайты, извлечёт цены и сведёт итог. Продолжит с места обрыва.">Найти</button>
           <button class="btn ghost" id="stopBtn" hidden title="Остановить текущий поиск">⏹ Стоп</button>
+          <button class="btn ghost" id="refillBtn" hidden title="Заново разобрать моделью страницы, которые она не смотрела: цены «не проверено моделью» и сайты с причиной «модель недоступна». Страницы берутся из кэша — сайты не открываются заново, поиск не повторяется, платим только за вызовы модели">↻ Переизвлечь</button>
           <button class="btn" id="reportBtn" disabled title="Итоговый Excel-отчёт: лист «Итоги» (Товар, Цена, Тип, Найденное название, Мин, Макс, Источник, Ссылка, Комментарий) и лист «Детали» — все сайты выдачи с ценами, статусами и комментариями. Скачивается сразу: модель не вызывается">📑 Отчёт (xlsx)</button>
           <button class="btn ghost danger" id="resetBtn" disabled title="Стереть весь прогресс поиска (с подтверждением) и начать заново">Сбросить прогресс</button>
         </div>
@@ -122,6 +123,7 @@
         <!-- Диалог скрыт по решению пользователя: вернуть = снять hidden с кнопки и панели -->
         <button class="tab" data-tab="dialog" hidden>Диалог</button>
         <button class="tab" data-tab="queue" id="queueTab">Очередь</button>
+        <button class="tab" data-tab="blocked" id="blockedTab" title="Сайты, которые закрылись капчей: откройте их вручную — цена подтянется сама">Блокировки</button>
         <button class="tab active" data-tab="trace">Ход</button>
         <button class="tab" data-tab="model" title="Что отвечает модель по каждой позиции">Модель</button>
         <div class="tab-tools" id="traceTools" hidden>
@@ -134,6 +136,16 @@
           <input id="logSearch" type="search" placeholder="фильтр…" />
           <button class="linklike" id="logAutoscroll" data-on="1" title="Автоскролл">⬇ авто</button>
           <button class="linklike" id="logClear" title="Очистить вид">очистить</button>
+        </div>
+        <div class="tab-tools blk-tools" id="blockedTools" hidden>
+          <input id="blockedSearch" type="search" placeholder="домен или товар…" title="Показать только страницы, где встречается этот текст: например, wildberries" />
+          <label class="chk-inline" title="Оставить только те товары, по которым итоговой цены нет или она «по запросу». Остальные заблокированные страницы открывать незачем — цена по позиции уже есть.">
+            <input type="checkbox" id="blockedNoPrice" /> только без цены
+          </label>
+          <span class="seg-mini" id="blockedGroup" title="Группировать: по домену — одна проверка закрывает много страниц; по товару — прокликать всё по конкретной позиции">
+            <button type="button" data-group="domain" class="active">по домену</button>
+            <button type="button" data-group="item">по товару</button>
+          </span>
         </div>
         <div class="tab-tools" id="modelTools" hidden>
           <input id="modelSearch" type="search" placeholder="номер или название…" title="Показать только записи по позициям, где встречается этот текст (можно номер позиции)" />
@@ -174,6 +186,13 @@
           <div class="queue-col" data-col="queued"><h4>В очереди</h4><div class="queue-list" id="qQueued"></div></div>
           <div class="queue-col" data-col="done"><h4>Готово</h4><div class="queue-list" id="qDone"></div></div>
         </div>
+      </div>
+
+      <!-- Блокировки: страницы, закрытые капчей. Открыл домен вручную — остальные его страницы
+           инструмент допробует сам (кука проверки лежит в общем профиле браузера). -->
+      <div class="tab-panel" id="panel-blocked" hidden>
+        <div class="blk-empty" id="blockedEmpty">Заблокированных сайтов нет.</div>
+        <div class="blk-list" id="blockedList"></div>
       </div>
 
       <!-- Ход: только консольные логи (что делает программа) -->
@@ -280,7 +299,7 @@
 
   <!-- ============== Модалка «Режим открытия сайтов» + «Сценарий очистки» ============== -->
   <div class="modal-overlay" id="modeModal" hidden>
-    <div class="modal">
+    <div class="modal" id="modeModalBox">
       <div class="modal-head">
         <h2>Открытие сайтов и очистка</h2>
         <button class="btn ghost icon" id="modeClose">✕</button>
@@ -289,6 +308,35 @@
         <button type="button" class="mtab active" data-mtab="open">Режим открытия</button>
         <button type="button" class="mtab" data-mtab="clean">Сценарий очистки</button>
         <button type="button" class="mtab" data-mtab="profile">Профиль поиска</button>
+        <button type="button" class="mtab" data-mtab="sites">Сайты</button>
+      </div>
+
+      <!-- ---- Вкладка: Сайты. Реестр доменов, накопленный за прогоны ---------------- -->
+      <div class="form mtab-panel" id="mpanel-sites" hidden>
+        <p class="muted mode-intro">Реестр сайтов, которые встречались в работе. Уровень
+          сохраняется и действует в следующих запусках. «Пониженный» — сайт остаётся в работе,
+          но смотрим его последним и верим меньше; «запрещён» — не открываем вовсе.
+          Новые домены попадают сюда сами.</p>
+
+        <div class="mode-group">
+          <div class="mode-group-t">Разрешённые и запрещённые зоны</div>
+          <label class="fld">Разрешённые зоны <span class="muted">(через запятую; пусто — без ограничения)</span>
+            <input id="sitesAllowTld" placeholder="ru, рф, com" />
+          </label>
+          <label class="fld">Запрещённые зоны <span class="muted">(через запятую) — сильнее разрешённых</span>
+            <input id="sitesBanTld" placeholder="kz, ua, by" />
+          </label>
+        </div>
+
+        <div class="mode-group">
+          <div class="mode-group-t">Домены</div>
+          <div class="sites-bar">
+            <input id="sitesSearch" type="search" placeholder="поиск по домену…" />
+            <label class="chk-inline"><input type="checkbox" id="sitesOnlyRated" /> только помеченные</label>
+            <span class="sites-count" id="sitesCount"></span>
+          </div>
+          <div class="sites-list" id="sitesList"></div>
+        </div>
       </div>
 
       <!-- ---- Вкладка: Профиль поиска (сохраняется на сервере, переживает перезапуск) ---- -->
@@ -449,6 +497,6 @@
   </div>
 
   <div class="toasts" id="toasts"></div>
-  <script src="/app.js?v=31"></script>
+  <script src="/app.js?v=37"></script>
 </body>
 </html>

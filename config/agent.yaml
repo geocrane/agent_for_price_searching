@@ -16,4 +16,3 @@ stage_positions: 5              # позиций одновременно на �
 stage_positions_by_kind:
   extract: 10
 
-model_lanes: 1                  # полос модельной очереди оркестратора (модель отвечает серийно)

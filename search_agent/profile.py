@@ -27,6 +27,43 @@ log = get_logger("profile")
 DEFAULT_NAME = "по умолчанию"
 PREFERRED_WEIGHT = 1.0          # приоритетный домен пользователя доверяем как официальному источнику
 
+# Уровни домена в реестре сайтов (настройки → «Сайты»).
+LEVEL_PREFERRED = "preferred"   # вес официального источника, идёт первым
+LEVEL_NORMAL = "normal"         # как все: вес из общего рейтинга sources.yaml
+LEVEL_LOWERED = "lowered"       # смотрим, но в последнюю очередь и с урезанным доверием
+LEVEL_BANNED = "banned"         # не грузим вовсе (чёрный список)
+LEVELS = (LEVEL_PREFERRED, LEVEL_NORMAL, LEVEL_LOWERED, LEVEL_BANNED)
+
+
+def _norm_domain(raw: str) -> str:
+    """Домен в сравнимом виде: нижний регистр, без схемы, без www, без пути и порта."""
+    d = str(raw or "").strip().lower()
+    d = d.split("//")[-1].split("/")[0].split(":")[0].removeprefix("www.")
+    return d
+
+
+def tld_forms(raw: str) -> set[str]:
+    """Зона в обеих формах: юникод и punycode.
+
+    Пользователь пишет «рф», а поисковая выдача отдаёт `xn--p1ai` (в реальной сессии домены
+    именно такие: `xn--80adgebororwy.xn--p1ai`). Сравнивать надо и то, и другое, иначе правило
+    молча не работает — худший вид неработающей настройки.
+    """
+    z = str(raw or "").strip().lower().lstrip(".")
+    if not z:
+        return set()
+    out = {z}
+    try:
+        out.add(z.encode("idna").decode("ascii"))
+    except (UnicodeError, ValueError):
+        pass
+    if z.startswith("xn--"):
+        try:
+            out.add(z.encode("ascii").decode("idna"))
+        except (UnicodeError, ValueError):
+            pass
+    return out
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS search_profile (
     name       TEXT PRIMARY KEY,
@@ -44,8 +81,18 @@ class SearchProfile(BaseModel):
     # Модель переписывает наименования в «магазинные» запросы. По умолчанию ВЫКЛЮЧЕНО: это
     # отдельный пакет платных вызовов до начала поиска, и включает его пользователь осознанно.
     use_llm_queries: bool = False
+    # Устаревшие плоские списки: остаются ради совместимости с сохранёнными профилями и с
+    # полями «через запятую» в интерфейсе. Источник правды — `domain_ratings` (см. `ratings`).
     preferred_domains: list[str] = Field(default_factory=list)   # свои проверенные поставщики
     blocked_domains: list[str] = Field(default_factory=list)     # мусорные для этой отрасли
+    # Домен → уровень: preferred | normal | lowered | banned. «Пониженный» — не то же самое, что
+    # «запрещённый»: сайт остаётся в работе, но с урезанным весом и в конце очереди загрузки.
+    # Раньше градации не было вовсе — домен либо приоритетный, либо выброшенный.
+    domain_ratings: dict[str, str] = Field(default_factory=dict)
+    # Зоны. Пустой список разрешённых = ограничения нет (не «запрещено всё»). Нужны, потому что
+    # перечислять поштучно все домены чужой страны бессмысленно: их всегда находится ещё один.
+    allowed_tlds: list[str] = Field(default_factory=list)        # напр. ru, рф, com
+    banned_tlds: list[str] = Field(default_factory=list)         # напр. kz, ua, by
     # Вторая страница выдачи — не «глубина поиска», а реакция на пустой результат: она
     # запрашивается ТОЛЬКО по позициям, где на первой странице не нашлось ни одной цены.
     # Нашли цену — глубже не идём: каждая страница это отдельный оплачиваемый запрос к поиску.
@@ -61,6 +108,23 @@ class SearchProfile(BaseModel):
     def max_pages(self) -> int:
         """Предел глубины выдачи для движка. Дальше второй страницы не ходим никогда."""
         return 2 if self.second_page_if_empty else 1
+
+    def ratings(self) -> dict[str, str]:
+        """Эффективные уровни доменов: старые плоские списки + явные `domain_ratings`.
+
+        Явный уровень важнее унаследованного списка: пользователь только что нажал его руками.
+        """
+        out: dict[str, str] = {}
+        pref, blocked = self.normalized_domains()
+        for d in pref:
+            out[d] = LEVEL_PREFERRED
+        for d in blocked:
+            out[d] = LEVEL_BANNED
+        for raw, level in (self.domain_ratings or {}).items():
+            d = _norm_domain(raw)
+            if d and level in LEVELS:
+                out[d] = level
+        return {d: lv for d, lv in out.items() if lv != LEVEL_NORMAL}
 
     def normalized_domains(self) -> tuple[list[str], list[str]]:
         """Домены в сравнимом виде: нижний регистр, без схемы, без www и пути."""
@@ -153,15 +217,28 @@ def list_names(cfg=None) -> list[str]:
 
 
 def apply_to_settings(profile: SearchProfile, settings) -> None:
-    """Подмешать домены профиля в рейтинг источников. Общий рейтинг НЕ заменяем, а дополняем.
+    """Подмешать домены и зоны профиля в рейтинг источников. Общий рейтинг НЕ заменяем, а дополняем.
 
-    Приоритетные домены получают вес официального источника, запрещённые — попадают в чёрный
-    список (в `discovery/rerank` он даёт вес 0 и кандидата отбрасывает).
+    Приоритетные домены получают вес официального источника, пониженные — множитель к весу и
+    последнее место в очереди загрузки, запрещённые — чёрный список (в `discovery/rerank` он даёт
+    вес 0 и кандидата отбрасывает). Зоны работают тем же механизмом веса 0.
     """
-    preferred, blocked = profile.normalized_domains()
+    levels = profile.ratings()
+    preferred = sorted(d for d, lv in levels.items() if lv == LEVEL_PREFERRED)
+    lowered = sorted(d for d, lv in levels.items() if lv == LEVEL_LOWERED)
+    banned = sorted(d for d, lv in levels.items() if lv == LEVEL_BANNED)
+    allowed_z = {f for z in (profile.allowed_tlds or []) for f in tld_forms(z)}
+    banned_z = {f for z in (profile.banned_tlds or []) for f in tld_forms(z)}
+
     sources = dict(settings.sources or {})
-    if blocked:
-        sources["blacklist"] = sorted(set(sources.get("blacklist") or []) | set(blocked))
+    if banned:
+        sources["blacklist"] = sorted(set(sources.get("blacklist") or []) | set(banned))
+    if lowered:
+        sources["lowered"] = sorted(set(sources.get("lowered") or []) | set(lowered))
+    if allowed_z:
+        sources["allowed_tlds"] = sorted(allowed_z)
+    if banned_z:
+        sources["banned_tlds"] = sorted(banned_z)
     if preferred:
         tiers = {k: dict(v) for k, v in (sources.get("tiers") or {}).items()}
         tier = dict(tiers.get(1) or {"weight": PREFERRED_WEIGHT, "domains": []})
@@ -171,6 +248,9 @@ def apply_to_settings(profile: SearchProfile, settings) -> None:
         sources["tiers"] = tiers
     settings.sources = sources
     settings.extract.strict_analog_judge = profile.strict_analog
-    if preferred or blocked:
-        log.info("Профиль %r: приоритетных доменов=%d, запрещённых=%d",
-                 profile.name, len(preferred), len(blocked))
+    if preferred or lowered or banned or allowed_z or banned_z:
+        log.info("Профиль %r: приоритетных=%d, пониженных=%d, запрещённых=%d, "
+                 "разрешённые зоны=%s, запрещённые зоны=%s", profile.name,
+                 len(preferred), len(lowered), len(banned),
+                 ", ".join(sorted(profile.allowed_tlds or [])) or "—",
+                 ", ".join(sorted(profile.banned_tlds or [])) or "—")
